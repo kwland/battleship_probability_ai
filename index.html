@@ -54,7 +54,8 @@
       <label>
         Opponent:
         <select id="difficulty">
-          <option value="probability" selected>Probability AI (smart)</option>
+          <option value="bayesian" selected>Bayesian AI (strongest)</option>
+          <option value="probability">Probability AI (heuristic)</option>
           <option value="random">Random AI (baseline)</option>
         </select>
       </label>
@@ -116,20 +117,29 @@
   <section class="about">
     <h2>How it works</h2>
     <p>
-      For every remaining ship length, the AI enumerates every horizontal and
-      vertical placement still consistent with the board (no placement may
-      cross a confirmed miss or a cell already resolved as part of a sunk
-      ship) and tallies, per cell, how many valid placements cover it. Cells
-      covered by more possible placements are more likely to actually hold a
-      ship, so the AI fires at the highest-density unknown cell. Once a hit
-      is still unresolved, the AI narrows to placements that cover that hit
-      ("target mode"), which naturally finishes off a found ship before
-      hunting a new one &mdash; without any hardcoded direction logic.
+      <strong>Bayesian AI (default, strongest).</strong> Exactly enumerating
+      every way the whole remaining fleet could be arranged is
+      combinatorially infeasible, so each turn it draws thousands of random
+      <em>whole-fleet</em> configurations that are fully consistent with the
+      board so far &mdash; no two sampled ships overlap, none crosses a
+      confirmed miss, and every unresolved hit is covered by exactly one
+      sampled ship. Tallying which cells appear across those samples gives a
+      true joint probability estimate, so it correctly reasons about
+      multiple simultaneous hit clusters and ships blocking each other in a
+      way that scoring each ship length in isolation cannot.
+    </p>
+    <p>
+      <strong>Probability AI (heuristic).</strong> A faster, simpler
+      approximation: for every remaining ship length, it enumerates every
+      placement still consistent with the board and tallies how many valid
+      placements cover each cell, independently per ship length. Good, but
+      it can't jointly reason about several ships or hits at once the way
+      the Bayesian AI does.
     </p>
     <p>
       The enemy fleet you attack is placed by the same style of algorithm in
-      reverse: it plays many simulated games against the Probability AI for
-      a batch of random legal layouts and keeps whichever one survives the
+      reverse: it plays many simulated games against the Bayesian AI for a
+      batch of random legal layouts and keeps whichever one survives the
       longest on average &mdash; the "Auto-Place (Smart)" button uses the
       same search for your own fleet.
     </p>

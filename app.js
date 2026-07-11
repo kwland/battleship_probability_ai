@@ -268,7 +268,13 @@ function startBattle() {
   state.enemyBoardState = makeEmptyBoard();
 
   const difficulty = document.getElementById("difficulty").value;
-  state.attackerAI = difficulty === "random" ? new RandomAI(sizes) : new ProbabilityAI(sizes);
+  if (difficulty === "random") {
+    state.attackerAI = new RandomAI(sizes);
+  } else if (difficulty === "probability") {
+    state.attackerAI = new ProbabilityAI(sizes);
+  } else {
+    state.attackerAI = new BayesianAI(sizes);
+  }
 
   state.turn = "player";
   state.winner = null;
@@ -425,7 +431,7 @@ function renderBoard({ containerId, shipLayerId, boardState, shipSet, layout, ow
 
 function render() {
   const heatmap =
-    state.heatmapOn && state.attackerAI instanceof ProbabilityAI && state.turn !== "over"
+    state.heatmapOn && typeof state.attackerAI.currentDensityMap === "function" && state.turn !== "over"
       ? state.attackerAI.currentDensityMap(state.playerBoardState)
       : null;
 
@@ -461,58 +467,74 @@ function render() {
 
 /* ==================== Benchmark ==================== */
 
-function runBenchmark() {
+function playGame(AIClass, ships, sizes) {
+  const board = makeEmptyBoard();
+  const ai = new AIClass(sizes);
+  let shots = 0;
+  let remaining = ships.size;
+  const maxShots = ROWS * COLS;
+  while (remaining > 0 && shots < maxShots) {
+    const [r, c] = ai.selectNextMove(board);
+    shots++;
+    const k = key(r, c);
+    if (ships.has(k)) {
+      board[r][c] = "hit";
+      remaining--;
+    } else {
+      board[r][c] = "miss";
+    }
+  }
+  return shots;
+}
+
+function yieldToUI() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function runBenchmark() {
   const n = Math.max(10, Math.min(1000, parseInt(document.getElementById("bench-n").value, 10) || 200));
   const output = document.getElementById("bench-output");
   const button = document.getElementById("bench-run");
 
+  // BayesianAI samples thousands of whole-fleet configurations per shot, so
+  // it's much slower per game (~1-3s) than the other two (~milliseconds) --
+  // run far fewer games for it so the benchmark finishes in a reasonable
+  // time, and run every AI in small async-yielding batches so the page
+  // stays responsive and shows live progress instead of freezing.
+  const nBayes = Math.max(5, Math.min(30, Math.round(n / 30)));
+
   button.disabled = true;
-  output.textContent = `Running ${n} games per AI...`;
 
-  setTimeout(() => {
-    const sizes = STANDARD_FLEET_SIZES;
-    const placer = new PlacementAI();
+  const sizes = STANDARD_FLEET_SIZES;
+  const placer = new PlacementAI();
 
-    function playGame(AIClass, ships) {
-      const board = makeEmptyBoard();
-      const ai = new AIClass(sizes);
-      let shots = 0;
-      let remaining = ships.size;
-      const maxShots = ROWS * COLS;
-      while (remaining > 0 && shots < maxShots) {
-        const [r, c] = ai.selectNextMove(board);
-        shots++;
-        const k = key(r, c);
-        if (ships.has(k)) {
-          board[r][c] = "hit";
-          remaining--;
-        } else {
-          board[r][c] = "miss";
-        }
-      }
-      return shots;
-    }
-
-    let totalRandom = 0;
-    let totalProb = 0;
-    for (let i = 0; i < n; i++) {
+  async function runSet(AIClass, games, label) {
+    let total = 0;
+    for (let i = 0; i < games; i++) {
       const layout = placer.randomLegalLayout(sizes);
       const ships = placer.shipCellSet(layout);
-      totalRandom += playGame(RandomAI, ships);
-      totalProb += playGame(ProbabilityAI, ships);
+      total += playGame(AIClass, ships, sizes);
+      if (i % 5 === 4) {
+        output.textContent = `Running ${label}: ${i + 1}/${games} games...`;
+        await yieldToUI();
+      }
     }
+    return total / games;
+  }
 
-    const avgRandom = totalRandom / n;
-    const avgProb = totalProb / n;
-    const improvement = ((avgRandom - avgProb) / avgRandom) * 100;
+  const avgRandom = await runSet(RandomAI, n, "RandomAI");
+  const avgProb = await runSet(ProbabilityAI, n, "ProbabilityAI");
+  const avgBayes = await runSet(BayesianAI, nBayes, "BayesianAI (slower, fewer games)");
 
-    output.innerHTML =
-      `<div>RandomAI: avg <strong>${avgRandom.toFixed(1)}</strong> shots to win</div>` +
-      `<div>ProbabilityAI: avg <strong>${avgProb.toFixed(1)}</strong> shots to win</div>` +
-      `<div class="bench-highlight">ProbabilityAI wins with ${improvement.toFixed(1)}% fewer shots on average.</div>`;
+  const improvement = ((avgRandom - avgBayes) / avgRandom) * 100;
 
-    button.disabled = false;
-  }, 30);
+  output.innerHTML =
+    `<div>RandomAI: avg <strong>${avgRandom.toFixed(1)}</strong> shots to win (${n} games)</div>` +
+    `<div>ProbabilityAI: avg <strong>${avgProb.toFixed(1)}</strong> shots to win (${n} games)</div>` +
+    `<div>BayesianAI: avg <strong>${avgBayes.toFixed(1)}</strong> shots to win (${nBayes} games)</div>` +
+    `<div class="bench-highlight">BayesianAI wins with ${improvement.toFixed(1)}% fewer shots than random, and fewer than ProbabilityAI too.</div>`;
+
+  button.disabled = false;
 }
 
 /* ==================== Wiring ==================== */

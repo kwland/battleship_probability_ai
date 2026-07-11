@@ -235,6 +235,286 @@ class ProbabilityAI {
   }
 }
 
+/* ---------------- BayesianAI ---------------- */
+
+const BAYES_TIME_BUDGET_MS = 3000;
+const BAYES_SAFETY_MARGIN_MS = 500;
+const BAYES_SOFT_TIME_BUDGET_MS = 500;
+const BAYES_MAX_SAMPLES = 1500;
+const BAYES_MAX_TOTAL_ATTEMPTS = 60000;
+const BAYES_MAX_POOL_PICK_ATTEMPTS = 40;
+
+class BayesianAI {
+  /*
+   * Shot-selection AI using Monte Carlo configuration-space sampling to
+   * approximate the true Bayesian posterior probability that each cell
+   * holds a ship, given the remaining fleet and the board's hit/miss
+   * history.
+   *
+   * Exact enumeration of every way the whole remaining fleet could be
+   * arranged is combinatorially infeasible even on this small 88-cell
+   * board, so this samples instead: each sample is one complete,
+   * internally consistent arrangement of every remaining ship -- no two
+   * ships overlap, none crosses a confirmed miss or an already-sunk
+   * ship's cells, and every unresolved hit cell is covered by exactly one
+   * of the sampled ships. Tallying which cells appear across thousands of
+   * such valid samples gives a much sharper, *jointly* consistent
+   * probability estimate than scoring each ship length in isolation (see
+   * ProbabilityAI): it correctly accounts for ships blocking each other
+   * and for multiple simultaneous hit clusters needing to be explained by
+   * different ships at once.
+   *
+   * Sampling a configuration:
+   *   Phase A -- cover every currently unresolved hit. Repeatedly pick an
+   *   uncovered hit cell, enumerate every (remaining ship length,
+   *   placement) pair that legally covers it, and pick one at random.
+   *   This is what lets the AI reason "a length-4 ship covering both of
+   *   these hits, with a gap between them, is possible" without any
+   *   hardcoded direction logic -- the placement enumeration naturally
+   *   allows it.
+   *   Phase B -- place whatever ships are left (not needed to explain a
+   *   hit) at random legal positions in the remaining free space, drawn
+   *   from a precomputed pool of legal placements (not blind random
+   *   guesses across the whole board) so sampling stays fast even
+   *   late-game when most coordinates are already known misses.
+   */
+
+  constructor(fleetSizes) {
+    this.fleetSizes = fleetSizes ? [...fleetSizes] : [...STANDARD_FLEET_SIZES];
+    this.remainingSizes = [...this.fleetSizes];
+    this.resolvedSunkCells = new Set();
+  }
+
+  selectNextMove(board) {
+    const start = performance.now();
+
+    const unknown = [];
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        if (board[r][c] === null) unknown.push([r, c]);
+      }
+    }
+    if (unknown.length === 0) throw new Error("No legal moves remain: board is full.");
+
+    try {
+      this.updateSunkShips(board);
+
+      if (BAYES_TIME_BUDGET_MS - (performance.now() - start) < BAYES_SAFETY_MARGIN_MS) {
+        return choice(unknown);
+      }
+
+      let { density, samples } = this.sampleDensity(board, start);
+      if (samples === 0) density = this.fallbackDensity(board);
+
+      let bestScore = -1;
+      for (const [r, c] of unknown) {
+        const d = density.get(key(r, c));
+        if (d > bestScore) bestScore = d;
+      }
+      const bestCells = unknown.filter(([r, c]) => density.get(key(r, c)) === bestScore);
+      return choice(bestCells);
+    } catch (e) {
+      return choice(unknown);
+    }
+  }
+
+  /** Exposed so the UI can render a live heatmap of the AI's current thinking. */
+  currentDensityMap(board) {
+    const start = performance.now();
+    this.updateSunkShips(board);
+    let { density, samples } = this.sampleDensity(board, start);
+    if (samples === 0) density = this.fallbackDensity(board);
+    return density;
+  }
+
+  sampleDensity(board, startTime) {
+    const blocked = this.blockedCells(board);
+    const activeHits = this.activeHits(board);
+    const validByLength = new Map();
+    for (const length of new Set(this.remainingSizes)) {
+      validByLength.set(length, this.allValidPlacements(length, blocked));
+    }
+
+    const density = new Map();
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) density.set(key(r, c), 0);
+
+    let samples = 0;
+    let attempts = 0;
+    const softDeadline = startTime + BAYES_SOFT_TIME_BUDGET_MS;
+    const hardDeadline = startTime + BAYES_TIME_BUDGET_MS - BAYES_SAFETY_MARGIN_MS;
+
+    while (samples < BAYES_MAX_SAMPLES && attempts < BAYES_MAX_TOTAL_ATTEMPTS) {
+      attempts++;
+      if (attempts % 64 === 0) {
+        const now = performance.now();
+        if (now > hardDeadline || (now > softDeadline && samples >= 50)) break;
+      }
+
+      const cells = this.tryBuildSample(activeHits, validByLength);
+      if (cells === null) continue;
+      samples++;
+      for (const cell of cells) {
+        const k = key(cell[0], cell[1]);
+        density.set(k, density.get(k) + 1);
+      }
+    }
+
+    return { density, samples };
+  }
+
+  tryBuildSample(activeHits, validByLength) {
+    const occupied = new Set();
+    const remaining = [...this.remainingSizes];
+    const uncovered = new Set(activeHits);
+
+    while (uncovered.size > 0) {
+      const h = uncovered.values().next().value;
+      const [hr, hc] = h.split(",").map(Number);
+      const candidates = []; // [length, cells]
+      for (const length of new Set(remaining)) {
+        for (const cells of validByLength.get(length)) {
+          if (cells.some(([r, c]) => r === hr && c === hc) && this.cellsFree(cells, occupied)) {
+            candidates.push([length, cells]);
+          }
+        }
+      }
+      if (candidates.length === 0) return null;
+      const [length, cells] = choice(candidates);
+      for (const [r, c] of cells) occupied.add(key(r, c));
+      remaining.splice(remaining.indexOf(length), 1);
+      for (const [r, c] of cells) uncovered.delete(key(r, c));
+    }
+
+    for (const length of remaining) {
+      const cells = this.pickFromPool(validByLength.get(length), occupied);
+      if (cells === null) return null;
+      for (const [r, c] of cells) occupied.add(key(r, c));
+    }
+
+    return [...occupied].map((k) => k.split(",").map(Number));
+  }
+
+  pickFromPool(pool, occupied, maxAttempts = BAYES_MAX_POOL_PICK_ATTEMPTS) {
+    const n = pool.length;
+    if (n === 0) return null;
+    for (let i = 0; i < Math.min(maxAttempts, n); i++) {
+      const cells = pool[randInt(n)];
+      if (this.cellsFree(cells, occupied)) return cells;
+    }
+    return null;
+  }
+
+  allValidPlacements(length, blocked) {
+    const placements = [];
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c <= COLS - length; c++) {
+        const cells = [];
+        for (let i = 0; i < length; i++) cells.push([r, c + i]);
+        if (this.cellsFree(cells, blocked)) placements.push(cells);
+      }
+    }
+    for (let r = 0; r <= ROWS - length; r++) {
+      for (let c = 0; c < COLS; c++) {
+        const cells = [];
+        for (let i = 0; i < length; i++) cells.push([r + i, c]);
+        if (this.cellsFree(cells, blocked)) placements.push(cells);
+      }
+    }
+    return placements;
+  }
+
+  cellsFree(cells, ...blockers) {
+    for (const [r, c] of cells) {
+      for (const blocker of blockers) {
+        if (blocker.has(key(r, c))) return false;
+      }
+    }
+    return true;
+  }
+
+  blockedCells(board) {
+    const blocked = new Set(this.resolvedSunkCells);
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        if (board[r][c] === "miss") blocked.add(key(r, c));
+      }
+    }
+    return blocked;
+  }
+
+  activeHits(board) {
+    const hits = new Set();
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        if (board[r][c] === "hit" && !this.resolvedSunkCells.has(key(r, c))) hits.add(key(r, c));
+      }
+    }
+    return hits;
+  }
+
+  fallbackDensity(board) {
+    const blocked = this.blockedCells(board);
+    const density = new Map();
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) density.set(key(r, c), 0);
+    for (const length of new Set(this.remainingSizes)) {
+      for (const cells of this.allValidPlacements(length, blocked)) {
+        for (const [r, c] of cells) {
+          const k = key(r, c);
+          density.set(k, density.get(k) + 1);
+        }
+      }
+    }
+    return density;
+  }
+
+  updateSunkShips(board) {
+    const runCells = (r, c, dr, dc) => {
+      const cells = [];
+      let rr = r,
+        cc = c;
+      while (rr >= 0 && rr < ROWS && cc >= 0 && cc < COLS && board[rr][cc] === "hit") {
+        cells.push([rr, cc]);
+        rr += dr;
+        cc += dc;
+      }
+      return cells;
+    };
+    const isCapped = ([rr, cc]) => {
+      if (rr < 0 || rr >= ROWS || cc < 0 || cc >= COLS) return true;
+      return board[rr][cc] === "miss";
+    };
+    const maybeMarkSunk = (cells, before, after) => {
+      const length = cells.length;
+      const idx = this.remainingSizes.indexOf(length);
+      if (idx === -1) return;
+      if (isCapped(before) && isCapped(after)) {
+        this.remainingSizes.splice(idx, 1);
+        for (const [r, c] of cells) this.resolvedSunkCells.add(key(r, c));
+      }
+    };
+
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        if (board[r][c] !== "hit" || this.resolvedSunkCells.has(key(r, c))) continue;
+        if (c === 0 || board[r][c - 1] !== "hit") {
+          const cells = runCells(r, c, 0, 1);
+          const before = [r, c - 1];
+          const last = cells[cells.length - 1];
+          const after = [last[0], last[1] + 1];
+          maybeMarkSunk(cells, before, after);
+        }
+        if (r === 0 || board[r - 1][c] !== "hit") {
+          const cells = runCells(r, c, 1, 0);
+          const before = [r - 1, c];
+          const last = cells[cells.length - 1];
+          const after = [last[0] + 1, last[1]];
+          maybeMarkSunk(cells, before, after);
+        }
+      }
+    }
+  }
+}
+
 /* ---------------- PlacementAI ---------------- */
 
 class PlacementAI {
@@ -268,6 +548,12 @@ class PlacementAI {
   }
 
   simulateGame(ships, sizes) {
+    // Uses the fast heuristic AI (not BayesianAI) as the internal evaluator
+    // -- BayesianAI is ~100x slower per game, which would make this search
+    // (dozens of simulated games) take minutes instead of ~1 second. A
+    // layout that resists ProbabilityAI well also resists BayesianAI well
+    // in practice, since both ultimately concentrate fire the same way
+    // once a hit is found.
     const board = makeEmptyBoard();
     const attacker = new ProbabilityAI(sizes);
     let shots = 0;
