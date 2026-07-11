@@ -49,12 +49,26 @@ goes further and never tries to *decide* anything about which ship is
 where — every consistent interpretation of a run of hits stays alive in the
 particle population until later shots naturally rule the wrong ones out.
 
+### Ship placement — evolved, mixed strategy
+
 Ship placement (both the enemy fleet and the "Auto-Place (Smart)" button)
-searches random legal layouts and keeps whichever one survives longest
-against simulated `ProbabilityAI` attacks — `BayesianAI` is ~100x slower per
-game, so using it for this repeated internal search would take minutes
-instead of about a second; a layout that resists `ProbabilityAI` well also
-holds up well against `BayesianAI` in practice.
+draws from `layouts.json`: a pool of ~50 strong-but-diverse layouts produced
+offline by an evolutionary search (`optimize_placement.py` in the Python
+project). The search evolves candidate layouts over many generations —
+mutating by moving, rotating, shifting, swapping, or clustering ships —
+scoring each by how many shots a panel of attackers needs to sink it, and
+rewards both average and worst-case survival. It then keeps ~50 layouts that
+are individually strong yet structurally different from one another.
+
+At game time PlacementAI picks one of those at random — a **mixed strategy**,
+so a repeat human opponent can't learn and exploit a single fixed pattern. If
+`layouts.json` is missing (or the page is opened via `file://`, where `fetch`
+is blocked), it falls back to a quick live search that keeps the best of a
+handful of random layouts.
+
+The offline screening uses the fast `ProbabilityAI`, not `BayesianAI`, purely
+for speed (Bayesian is ~100x slower per game); a layout that resists one
+resists the other in practice.
 
 ## Files
 
@@ -62,6 +76,8 @@ holds up well against `BayesianAI` in practice.
 - `style.css` — styling (dark/light aware)
 - `ai.js` — JS port of the AI logic (`RandomAI`, `ProbabilityAI`, `BayesianAI`, `PlacementAI`)
 - `app.js` — game state and UI wiring
+- `layouts.json` — pre-optimized diverse placement pool (see the Python
+  project's `optimize_placement.py`); optional — the app works without it
 
 ## Run locally
 

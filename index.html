@@ -149,11 +149,20 @@
       actually impossible once the rest of the board is taken into account.
     </p>
     <p>
-      The enemy fleet you attack is placed by the same style of algorithm in
-      reverse: it plays many simulated games against the Bayesian AI for a
-      batch of random legal layouts and keeps whichever one survives the
-      longest on average &mdash; the "Auto-Place (Smart)" button uses the
-      same search for your own fleet.
+      <strong>Ship placement.</strong> The enemy fleet (and the "Auto-Place
+      (Smart)" button) draws from a pool of layouts optimized offline by an
+      evolutionary search: it evolves candidate layouts over many
+      generations &mdash; mutating by moving, rotating, shifting, swapping,
+      or clustering ships &mdash; scoring each by how many shots a panel of
+      attackers needs to sink it, and rewards both average and
+      worst-case survival. From the result it keeps ~50 strong but
+      structurally <em>different</em> layouts and picks one at random each
+      game &mdash; a mixed strategy, so a repeat opponent can't learn a
+      single fixed pattern. (If that pre-computed pool isn't available, it
+      falls back to a quick live search that keeps the best of a handful of
+      random layouts.) The screening uses the fast Probability AI, not the
+      Bayesian AI, purely for speed &mdash; a layout that resists one
+      resists the other in practice.
     </p>
   </section>
 </main>

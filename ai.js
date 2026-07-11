@@ -168,27 +168,33 @@ class ProbabilityAI {
       for (let c = 0; c < COLS; c++) density.set(key(r, c), 0);
     }
 
-    const lengths = new Set(this.fleetSizes);
-    for (const length of lengths) {
+    // Weight each length by its multiplicity in the fleet. The standard
+    // fleet has two length-3 ships, so length-3 placements should count
+    // double; iterating over new Set(fleetSizes) would collapse them and
+    // systematically under-weight the doubled length.
+    const counts = new Map();
+    for (const length of this.fleetSizes) counts.set(length, (counts.get(length) || 0) + 1);
+
+    for (const [length, count] of counts) {
       for (let r = 0; r < ROWS; r++) {
         for (let c = 0; c <= COLS - length; c++) {
           const cells = [];
           for (let i = 0; i < length; i++) cells.push([r, c + i]);
-          this.scorePlacement(cells, board, density, requireActive);
+          this.scorePlacement(cells, board, density, requireActive, count);
         }
       }
       for (let r = 0; r <= ROWS - length; r++) {
         for (let c = 0; c < COLS; c++) {
           const cells = [];
           for (let i = 0; i < length; i++) cells.push([r + i, c]);
-          this.scorePlacement(cells, board, density, requireActive);
+          this.scorePlacement(cells, board, density, requireActive, count);
         }
       }
     }
     return density;
   }
 
-  scorePlacement(cells, board, density, requireActive) {
+  scorePlacement(cells, board, density, requireActive, weight) {
     let hasHit = false;
     let hasUnknown = false;
     for (const [r, c] of cells) {
@@ -200,7 +206,7 @@ class ProbabilityAI {
     if (requireActive && !(hasHit && hasUnknown)) return;
     for (const [r, c] of cells) {
       const k = key(r, c);
-      density.set(k, density.get(k) + 1);
+      density.set(k, density.get(k) + weight);
     }
   }
 }
@@ -276,6 +282,24 @@ class BayesianAI {
     this.fleetSizes = fleetSizes ? [...fleetSizes] : [...STANDARD_FLEET_SIZES];
     this.particles = null;
     this.processedCells = new Set();
+    // Cache the scores map keyed by a board signature. The UI renders the
+    // heatmap via currentDensityMap() and then the actual AI move calls
+    // selectNextMove() on the *same* board -- without this the (stateful)
+    // particle filtering + resampling would run twice per turn and, worse,
+    // the heatmap shown would be a different random sample than the one the
+    // AI actually acted on. Caching makes them one and the same.
+    this.cachedSignature = null;
+    this.cachedScores = null;
+  }
+
+  static signature(board) {
+    let s = "";
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        s += board[r][c] === "hit" ? "H" : board[r][c] === "miss" ? "M" : ".";
+      }
+    }
+    return s;
   }
 
   selectNextMove(board) {
@@ -320,6 +344,11 @@ class BayesianAI {
   }
 
   computeScores(board) {
+    const signature = BayesianAI.signature(board);
+    if (signature === this.cachedSignature && this.cachedScores !== null) {
+      return this.cachedScores;
+    }
+
     const start = performance.now();
 
     if (this.particles === null) {
@@ -333,7 +362,10 @@ class BayesianAI {
     for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) scores.set(key(r, c), 0);
 
     if (this.particles.length === 0) {
-      return this.fallbackScores(board);
+      const fallback = this.fallbackScores(board);
+      this.cachedSignature = signature;
+      this.cachedScores = fallback;
+      return fallback;
     }
 
     const n = this.particles.length;
@@ -396,7 +428,15 @@ class BayesianAI {
       }
     }
 
+    this.cachedSignature = signature;
+    this.cachedScores = scores;
     return scores;
+  }
+
+  lengthCounts() {
+    const counts = new Map();
+    for (const length of this.fleetSizes) counts.set(length, (counts.get(length) || 0) + 1);
+    return counts;
   }
 
   fallbackScores(board) {
@@ -408,14 +448,17 @@ class BayesianAI {
     }
     const density = new Map();
     for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) density.set(key(r, c), 0);
-    for (const length of new Set(this.fleetSizes)) {
+    // Weight each length by its multiplicity in the fleet -- the two
+    // length-3 ships must contribute twice as much placement mass as a
+    // single length, which iterating over new Set(fleetSizes) would miss.
+    for (const [length, count] of this.lengthCounts()) {
       for (const cells of this.allValidPlacements(length, blocked)) {
         const hasHit = cells.some(([r, c]) => board[r][c] === "hit");
         const hasUnknown = cells.some(([r, c]) => board[r][c] === null);
         if (hasHit && !hasUnknown) continue;
         for (const [r, c] of cells) {
           const k = key(r, c);
-          density.set(k, density.get(k) + 1);
+          density.set(k, density.get(k) + count);
         }
       }
     }
@@ -469,6 +512,21 @@ class BayesianAI {
     for (const length of new Set(this.fleetSizes)) {
       validByLength.set(length, this.allValidPlacements(length, blocked));
     }
+    // Static (occupied-agnostic) count of how many placements of each length
+    // cover each cell -- used to order hit resolution "most constrained
+    // first" without recomputing candidate sets just to decide which hit to
+    // tackle. cover is Map(length -> Map(cellKey -> count)).
+    const cover = new Map();
+    for (const [length, placements] of validByLength) {
+      const cc = new Map();
+      for (const cells of placements) {
+        for (const [r, c] of cells) {
+          const k = key(r, c);
+          cc.set(k, (cc.get(k) || 0) + 1);
+        }
+      }
+      cover.set(length, cc);
+    }
 
     const particles = [];
     let attempts = 0;
@@ -476,21 +534,37 @@ class BayesianAI {
     while (particles.length < targetCount && attempts < maxAttempts) {
       attempts++;
       if (attempts % 300 === 0 && performance.now() > deadline) break;
-      const ships = this.tryBuildParticle(activeHits, validByLength);
+      const ships = this.tryBuildParticle(activeHits, validByLength, cover);
       if (ships !== null) particles.push(this.makeParticle(ships));
     }
     return particles;
   }
 
-  tryBuildParticle(activeHits, validByLength) {
+  tryBuildParticle(activeHits, validByLength, cover) {
     const occupied = new Set();
     const remaining = [...this.fleetSizes];
     const uncovered = new Set(activeHits);
     const ships = [];
 
     while (uncovered.size > 0) {
-      const h = uncovered.values().next().value;
+      // Resolve the MOST CONSTRAINED hit first -- the uncovered hit
+      // reachable by the fewest legal ship placements (approximated cheaply
+      // from the static cover index, weighted by how many ships of each
+      // length remain). Committing to the hardest-to-satisfy hit early
+      // prunes dead-end partial configurations that a fixed "first hit"
+      // order would only discover after wasted work, cutting failed samples.
+      let h = null;
+      let hConstraint = Infinity;
+      for (const cand of uncovered) {
+        let total = 0;
+        for (const length of remaining) total += cover.get(length).get(cand) || 0;
+        if (total < hConstraint) {
+          hConstraint = total;
+          h = cand;
+        }
+      }
       const [hr, hc] = h.split(",").map(Number);
+
       const candidates = []; // [length, cells, weight]
       for (const length of new Set(remaining)) {
         for (const cells of validByLength.get(length)) {
@@ -507,17 +581,7 @@ class BayesianAI {
         }
       }
       if (candidates.length === 0) return null;
-      const totalWeight = candidates.reduce((sum, [, , w]) => sum + w, 0);
-      let pick = Math.random() * totalWeight;
-      let [length, cells] = [candidates[candidates.length - 1][0], candidates[candidates.length - 1][1]];
-      for (const [candLength, candCells, w] of candidates) {
-        pick -= w;
-        if (pick <= 0) {
-          length = candLength;
-          cells = candCells;
-          break;
-        }
-      }
+      const [length, cells] = this.weightedChoice(candidates);
       for (const [r, c] of cells) occupied.add(key(r, c));
       remaining.splice(remaining.indexOf(length), 1);
       for (const [r, c] of cells) uncovered.delete(key(r, c));
@@ -534,20 +598,38 @@ class BayesianAI {
     return ships;
   }
 
+  weightedChoice(candidates) {
+    let total = 0;
+    for (const [, , w] of candidates) total += w;
+    let pick = Math.random() * total;
+    for (const [length, cells, w] of candidates) {
+      pick -= w;
+      if (pick <= 0) return [length, cells];
+    }
+    return [candidates[candidates.length - 1][0], candidates[candidates.length - 1][1]];
+  }
+
   makeParticle(ships) {
     const occupied = new Set();
     for (const cells of ships) for (const [r, c] of cells) occupied.add(key(r, c));
     return { ships, occupied };
   }
 
-  pickFromPool(pool, occupied, maxAttempts = PARTICLE_MAX_POOL_PICK_ATTEMPTS) {
+  pickFromPool(pool, occupied, quickTries = PARTICLE_MAX_POOL_PICK_ATTEMPTS) {
     const n = pool.length;
     if (n === 0) return null;
-    for (let i = 0; i < Math.min(maxAttempts, n); i++) {
+    // Fast path: a few random draws. When the pool is mostly free (early
+    // game) this almost always succeeds immediately and avoids scanning the
+    // whole pool. Rejection sampling like this is uniform over legal cells.
+    for (let i = 0; i < Math.min(quickTries, n); i++) {
       const cells = pool[randInt(n)];
       if (this.cellsFree(cells, occupied)) return cells;
     }
-    return null;
+    // Correctness path: exhaustively collect legal placements so we never
+    // return null while a legal placement still exists (late game, when
+    // most of the pool is blocked). Also uniform over legal.
+    const legal = pool.filter((cells) => this.cellsFree(cells, occupied));
+    return legal.length ? choice(legal) : null;
   }
 
   allValidPlacements(length, blocked) {
@@ -582,6 +664,28 @@ class BayesianAI {
 
 /* ---------------- PlacementAI ---------------- */
 
+// Pool of pre-optimized, structurally-diverse layouts produced offline by
+// optimize_placement.py and shipped as layouts.json. Loaded once at startup
+// (see loadOptimizedLayouts). Each layout is an array of
+// {r, c, length, orientation}. Stays null if the file is missing/unreachable,
+// in which case PlacementAI falls back to a live game-based search.
+let OPTIMIZED_LAYOUTS = null;
+
+async function loadOptimizedLayouts(url = "layouts.json") {
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    OPTIMIZED_LAYOUTS = (data.layouts || []).map((layout) =>
+      layout.map(([r, c, length, orientation]) => ({ r, c, length, orientation }))
+    );
+  } catch (e) {
+    // No optimized pool available (e.g. opened via file:// where fetch is
+    // blocked, or the file was never generated). Live search will be used.
+    OPTIMIZED_LAYOUTS = null;
+  }
+}
+
 class PlacementAI {
   constructor({ restarts = 10, gamesPerCandidate = 3 } = {}) {
     this.restarts = restarts;
@@ -590,6 +694,19 @@ class PlacementAI {
 
   placeShips(fleetSizes) {
     const sizes = fleetSizes ? [...fleetSizes] : [...STANDARD_FLEET_SIZES];
+
+    // Mixed strategy: if the offline-optimized diverse pool is loaded, pick
+    // one of those layouts at random. Never reusing a single "best" layout
+    // keeps placement unpredictable to a repeat human opponent while every
+    // option is individually strong.
+    if (OPTIMIZED_LAYOUTS && OPTIMIZED_LAYOUTS.length) {
+      const wanted = [...sizes].sort((a, b) => a - b).join(",");
+      const matching = OPTIMIZED_LAYOUTS.filter(
+        (lay) => lay.map((s) => s.length).sort((a, b) => a - b).join(",") === wanted
+      );
+      if (matching.length) return choice(matching).map((s) => ({ ...s }));
+    }
+
     let bestLayout = null;
     let bestAvg = -Infinity;
     for (let i = 0; i < this.restarts; i++) {

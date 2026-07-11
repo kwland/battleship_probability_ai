@@ -560,5 +560,10 @@ document.addEventListener("DOMContentLoaded", () => {
     if (e.key === "r" || e.key === "R") rotateSelected();
   });
 
+  // Load the offline-optimized diverse placement pool in the background. If
+  // it arrives before the first battle, the enemy fleet and "Auto-Place
+  // (Smart)" draw from it; otherwise PlacementAI falls back to a live search.
+  loadOptimizedLayouts();
+
   initSetup();
 });
