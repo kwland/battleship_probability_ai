@@ -1,18 +1,15 @@
 /*
- * Battleship AI engine for an 8 x 11 board.
+ * Battleship AI engine -- JavaScript port of the Python reference
+ * implementation (ai/probability_ai.py, ai/random_ai.py, ai/placement_ai.py).
  *
- * The strongest opponent is BayesianAI. It combines:
- *   - exact sunk-ship feedback from the game engine,
- *   - complete-fleet particle filtering,
- *   - constrained resampling and Gibbs rejuvenation,
- *   - target/sink-aware scoring,
- *   - shallow lookahead,
- *   - optional learning from the player's previous layouts.
+ * Board: 8 rows x 11 columns. Cell state is one of:
+ *   null    -- not yet fired upon
+ *   "hit"   -- fired upon, ship present, not yet confirmed sunk
+ *   "miss"  -- fired upon, no ship
  */
 
 const ROWS = 8;
 const COLS = 11;
-const CELL_COUNT = ROWS * COLS;
 
 const STANDARD_FLEET = [
   { name: "Carrier", length: 5 },
@@ -25,15 +22,7 @@ const STANDARD_FLEET = [
 const STANDARD_FLEET_SIZES = STANDARD_FLEET.map((s) => s.length);
 
 function key(r, c) {
-  return `${r},${c}`;
-}
-
-function indexOfCell(r, c) {
-  return r * COLS + c;
-}
-
-function cellFromIndex(i) {
-  return [Math.floor(i / COLS), i % COLS];
+  return r + "," + c;
 }
 
 function randInt(n) {
@@ -42,15 +31,6 @@ function randInt(n) {
 
 function choice(arr) {
   return arr[randInt(arr.length)];
-}
-
-function shuffled(arr) {
-  const out = [...arr];
-  for (let i = out.length - 1; i > 0; i--) {
-    const j = randInt(i + 1);
-    [out[i], out[j]] = [out[j], out[i]];
-  }
-  return out;
 }
 
 function makeEmptyBoard() {
@@ -67,27 +47,6 @@ function shipCells(r, c, length, orientation) {
   return cells;
 }
 
-function normalizedCellSignature(cells) {
-  return cells.map(([r, c]) => key(r, c)).sort().join("|");
-}
-
-function layoutToParticle(layout) {
-  const ships = layout.map((ship) => {
-    if (ship.cells) return ship.cells.map(([r, c]) => [r, c]);
-    return shipCells(ship.r, ship.c, ship.length, ship.orientation);
-  });
-  const occupied = new Set();
-  const occupiedIndices = [];
-  const shipSignatures = ships.map((cells) => normalizedCellSignature(cells));
-  for (const cells of ships) {
-    for (const [r, c] of cells) {
-      occupied.add(key(r, c));
-      occupiedIndices.push(indexOfCell(r, c));
-    }
-  }
-  return { ships, shipSignatures, occupied, occupiedIndices };
-}
-
 /* ---------------- RandomAI ---------------- */
 
 class RandomAI {
@@ -102,396 +61,375 @@ class RandomAI {
         if (board[r][c] === null) candidates.push([r, c]);
       }
     }
-    if (!candidates.length) throw new Error("No legal moves remain.");
     return choice(candidates);
   }
-
-  recordShotResult() {}
 }
 
 /* ---------------- ProbabilityAI ---------------- */
 
 class ProbabilityAI {
+  /*
+   * Deliberately does NOT try to infer which specific ship a run of hits
+   * belongs to, or track "remaining" ship sizes that shrink as ships sink.
+   * An earlier version did this via a "capped run of hits" heuristic,
+   * which is unsound: when two ships happen to be placed touching each
+   * other, their combined hit run can look exactly like one longer ship,
+   * causing the AI to misidentify which ship sank and corrupt every
+   * density computation for the rest of the game (symptom: needing 87-88
+   * shots on an 88-cell board). The "active placement" condition below
+   * (covers a hit AND still has an unknown cell) gets the same practical
+   * benefit -- stop wasting shots on a fully-explained run -- without
+   * ever committing to a specific, possibly-wrong interpretation of which
+   * ship is where: a capped run of hits with no adjacent unknown cell
+   * simply can't extend, regardless of which ship(s) it turns out to be.
+   * See BayesianAI for a more powerful (and more expensive) version of
+   * this same idea using full joint particle sampling.
+   */
   constructor(fleetSizes) {
     this.fleetSizes = fleetSizes ? [...fleetSizes] : [...STANDARD_FLEET_SIZES];
-    this.remainingSizes = [...this.fleetSizes];
-    this.resolvedSunkCells = new Set();
-    this.cachedSignature = null;
-    this.cachedDensity = null;
   }
 
-  recordShotResult({ sunkLength = null, sunkCells = null } = {}) {
-    if (sunkLength && Array.isArray(sunkCells)) {
-      const idx = this.remainingSizes.indexOf(sunkLength);
-      if (idx !== -1) this.remainingSizes.splice(idx, 1);
-      for (const [r, c] of sunkCells) this.resolvedSunkCells.add(key(r, c));
-      this.cachedSignature = null;
-      this.cachedDensity = null;
+  selectNextMove(board) {
+    const unknown = [];
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        if (board[r][c] === null) unknown.push([r, c]);
+      }
+    }
+    if (unknown.length === 0) throw new Error("No legal moves remain: board is full.");
+
+    try {
+      let density = this.computeDensity(board, false);
+
+      let hasHits = false;
+      for (let r = 0; r < ROWS && !hasHits; r++) {
+        for (let c = 0; c < COLS; c++) {
+          if (board[r][c] === "hit") {
+            hasHits = true;
+            break;
+          }
+        }
+      }
+
+      if (hasHits) {
+        const targetDensity = this.computeDensity(board, true);
+        let anyPositive = false;
+        for (const v of targetDensity.values()) {
+          if (v > 0) {
+            anyPositive = true;
+            break;
+          }
+        }
+        if (anyPositive) density = targetDensity;
+      }
+
+      let bestScore = -1;
+      for (const [r, c] of unknown) {
+        const d = density.get(key(r, c));
+        if (d > bestScore) bestScore = d;
+      }
+      const bestCells = unknown.filter(([r, c]) => density.get(key(r, c)) === bestScore);
+      return choice(bestCells);
+    } catch (e) {
+      // Any unexpected failure must never cost us an invalid/slow move.
+      return choice(unknown);
     }
   }
 
-  boardSignature(board) {
+  /** Exposed so the UI can render a live heatmap of the AI's current thinking. */
+  currentDensityMap(board) {
+    let density = this.computeDensity(board, false);
+    let hasHits = false;
+    for (let r = 0; r < ROWS && !hasHits; r++) {
+      for (let c = 0; c < COLS; c++) {
+        if (board[r][c] === "hit") {
+          hasHits = true;
+          break;
+        }
+      }
+    }
+    if (hasHits) {
+      const targetDensity = this.computeDensity(board, true);
+      let anyPositive = false;
+      for (const v of targetDensity.values()) {
+        if (v > 0) {
+          anyPositive = true;
+          break;
+        }
+      }
+      if (anyPositive) density = targetDensity;
+    }
+    return density;
+  }
+
+  computeDensity(board, requireActive) {
+    const density = new Map();
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) density.set(key(r, c), 0);
+    }
+
+    // Weight each length by its multiplicity in the fleet. The standard
+    // fleet has two length-3 ships, so length-3 placements should count
+    // double; iterating over new Set(fleetSizes) would collapse them and
+    // systematically under-weight the doubled length.
+    const counts = new Map();
+    for (const length of this.fleetSizes) counts.set(length, (counts.get(length) || 0) + 1);
+
+    for (const [length, count] of counts) {
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c <= COLS - length; c++) {
+          const cells = [];
+          for (let i = 0; i < length; i++) cells.push([r, c + i]);
+          this.scorePlacement(cells, board, density, requireActive, count);
+        }
+      }
+      for (let r = 0; r <= ROWS - length; r++) {
+        for (let c = 0; c < COLS; c++) {
+          const cells = [];
+          for (let i = 0; i < length; i++) cells.push([r + i, c]);
+          this.scorePlacement(cells, board, density, requireActive, count);
+        }
+      }
+    }
+    return density;
+  }
+
+  scorePlacement(cells, board, density, requireActive, weight) {
+    let hasHit = false;
+    let hasUnknown = false;
+    for (const [r, c] of cells) {
+      const state = board[r][c];
+      if (state === "miss") return;
+      if (state === "hit") hasHit = true;
+      else if (state === null) hasUnknown = true;
+    }
+    if (requireActive && !(hasHit && hasUnknown)) return;
+    for (const [r, c] of cells) {
+      const k = key(r, c);
+      density.set(k, density.get(k) + weight);
+    }
+  }
+}
+
+/* ---------------- BayesianAI ---------------- */
+
+const PARTICLE_TARGET = 20000; // persistent population size
+const PARTICLE_MIN = 2500; // resample back up to PARTICLE_TARGET once we drop below this
+const RESAMPLE_SOFT_BUDGET_MS = 400; // this turn may spend roughly this long refilling the population
+const PARTICLE_MAX_POOL_PICK_ATTEMPTS = 40;
+
+// Hunt/target score weights -- see class docstring. Tunable via self-play.
+const W_ACTIVE_SHIP = 4.0;
+const W_SINK = 2.0;
+const W_OCCUPANCY_TARGET = 0.5;
+const W_INFO_GAIN_HUNT = 0.1;
+
+class BayesianAI {
+  /*
+   * Shot-selection AI backed by a persistent particle filter over complete
+   * fleet configurations.
+   *
+   * A "particle" is one complete, internally consistent guess at where the
+   * whole fleet is: every ship in the fleet gets a placement, no two ships
+   * overlap, and (once observations exist) every hit cell is covered and no
+   * miss cell is covered. The AI maintains a population of these particles
+   * across the whole game -- filtering, not rebuilding, it after each shot
+   * -- and derives its move purely from what fraction of surviving
+   * particles agree on each cell. This never needs to *decide* which ship a
+   * run of hits belongs to (the failure mode of a simpler capped-run
+   * heuristic once ships touch and their hit-runs merge): particles
+   * representing every remaining consistent interpretation stay alive side
+   * by side, weighted implicitly by how many valid whole-fleet completions
+   * support each one, and contradictory interpretations die out on their
+   * own as more of the board is revealed -- there is never a point where
+   * the AI commits to a wrong belief it can't recover from.
+   *
+   * Per shot:
+   *   1. Filter -- drop particles inconsistent with any new hit/miss.
+   *   2. Resample -- if too few particles survive, construct fresh ones
+   *      consistent with *all* evidence so far (covers every hit, avoids
+   *      every miss) to refill the population. Sampling reuses candidate
+   *      pools precomputed once per resample rather than rejecting blind
+   *      guesses, so refilling stays fast even late-game.
+   *   3. Score -- three probability maps, not one:
+   *        occupancy[cell]  = fraction of particles with *any* ship at cell.
+   *        activeShip[cell] = fraction of particles where `cell` belongs to
+   *                           a ship that has >=1 hit and >=1 still-unknown
+   *                           cell in that particle (i.e. a ship that's
+   *                           been found but not finished).
+   *        sink[cell]       = fraction of particles where `cell` is the
+   *                           *only* remaining unknown cell of such a ship
+   *                           (firing here would sink it in that
+   *                           hypothesis).
+   *      If any activeShip mass exists, target mode: score cells by
+   *      4*activeShip + 2*sink + 0.5*occupancy. Otherwise hunt mode: score
+   *      by occupancy + 0.10*informationGain, where informationGain uses
+   *      4*p*(1-p) as a cheap proxy for how much firing at a cell (roughly
+   *      50/50 to hit) would narrow the hypothesis space -- a one-step
+   *      lookahead in spirit without the cost of actually re-filtering the
+   *      whole population once per candidate cell.
+   *
+   * Simplifications made deliberately for a board this size: "resampling"
+   * regenerates fresh particles via constrained random construction rather
+   * than mutating survivors (simpler, and cheap enough here that true
+   * MCMC-style mutation isn't needed); informationGain is an analytic
+   * entropy proxy rather than a literal two-branch expected-value
+   * simulation. Coefficients above are reasonable defaults, tunable via
+   * self-play.
+   */
+
+  constructor(fleetSizes, options = {}) {
+    this.fleetSizes = fleetSizes ? [...fleetSizes] : [...STANDARD_FLEET_SIZES];
+    this.particleTarget = options.particles ?? PARTICLE_TARGET;
+    this.particleMin = options.minParticles ?? PARTICLE_MIN;
+    this.resampleBudgetMs = options.resampleBudgetMs ?? RESAMPLE_SOFT_BUDGET_MS;
+    this.poolPickAttempts = options.poolPickAttempts ?? PARTICLE_MAX_POOL_PICK_ATTEMPTS;
+    this.particles = null;
+    this.processedCells = new Set();
+    // Cache the scores map keyed by a board signature. The UI renders the
+    // heatmap via currentDensityMap() and then the actual AI move calls
+    // selectNextMove() on the *same* board -- without this the (stateful)
+    // particle filtering + resampling would run twice per turn and, worse,
+    // the heatmap shown would be a different random sample than the one the
+    // AI actually acted on. Caching makes them one and the same.
+    this.cachedSignature = null;
+    this.cachedScores = null;
+  }
+
+  static signature(board) {
     let s = "";
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
-        const k = key(r, c);
-        if (this.resolvedSunkCells.has(k)) s += "S";
-        else s += board[r][c] === "hit" ? "H" : board[r][c] === "miss" ? "M" : ".";
+        s += board[r][c] === "hit" ? "H" : board[r][c] === "miss" ? "M" : ".";
       }
     }
-    s += `|${this.remainingSizes.slice().sort((a, b) => a - b).join(",")}`;
     return s;
   }
 
   selectNextMove(board) {
     const unknown = [];
     for (let r = 0; r < ROWS; r++) {
-      for (let c = 0; c < COLS; c++) if (board[r][c] === null) unknown.push([r, c]);
+      for (let c = 0; c < COLS; c++) {
+        if (board[r][c] === null) unknown.push([r, c]);
+      }
     }
-    if (!unknown.length) throw new Error("No legal moves remain.");
+    if (unknown.length === 0) throw new Error("No legal moves remain: board is full.");
 
     try {
-      const density = this.currentDensityMap(board);
-      let best = -Infinity;
+      const scores = this.computeScores(board);
+
+      let bestScore = -Infinity;
       let bestCells = [];
       for (const [r, c] of unknown) {
-        const score = density.get(key(r, c)) || 0;
-        if (score > best + 1e-12) {
-          best = score;
+        const s = scores.get(key(r, c)) ?? 0;
+        if (s > bestScore + 1e-12) {
+          bestScore = s;
           bestCells = [[r, c]];
-        } else if (Math.abs(score - best) <= 1e-12) {
+        } else if (Math.abs(s - bestScore) <= 1e-12) {
           bestCells.push([r, c]);
         }
       }
-      return choice(bestCells.length ? bestCells : unknown);
-    } catch (error) {
+      if (bestCells.length === 0) return choice(unknown);
+      return choice(bestCells);
+    } catch (e) {
       return choice(unknown);
     }
   }
 
-  currentDensityMap(board) {
-    const signature = this.boardSignature(board);
-    if (signature === this.cachedSignature && this.cachedDensity) return this.cachedDensity;
-
-    let hasActiveHit = false;
-    for (let r = 0; r < ROWS && !hasActiveHit; r++) {
-      for (let c = 0; c < COLS; c++) {
-        if (board[r][c] === "hit" && !this.resolvedSunkCells.has(key(r, c))) {
-          hasActiveHit = true;
-          break;
-        }
-      }
-    }
-
-    let density = this.computeDensity(board, hasActiveHit);
-    let positiveUnknown = false;
-    if (hasActiveHit) {
-      for (let r = 0; r < ROWS && !positiveUnknown; r++) {
-        for (let c = 0; c < COLS; c++) {
-          if (board[r][c] === null && (density.get(key(r, c)) || 0) > 0) {
-            positiveUnknown = true;
-            break;
-          }
-        }
-      }
-      if (!positiveUnknown) density = this.computeDensity(board, false);
-    }
-
-    this.cachedSignature = signature;
-    this.cachedDensity = density;
-    return density;
-  }
-
-  computeDensity(board, targetMode) {
-    const density = new Map();
-    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) density.set(key(r, c), 0);
-
-    const lengthCounts = new Map();
-    for (const length of this.remainingSizes) lengthCounts.set(length, (lengthCounts.get(length) || 0) + 1);
-
-    for (const [length, multiplicity] of lengthCounts) {
-      for (const cells of this.allPlacements(length)) {
-        let hitCount = 0;
-        const unknown = [];
-        let legal = true;
-        for (const [r, c] of cells) {
-          const k = key(r, c);
-          if (board[r][c] === "miss" || this.resolvedSunkCells.has(k)) {
-            legal = false;
-            break;
-          }
-          if (board[r][c] === "hit") hitCount++;
-          else unknown.push([r, c]);
-        }
-        if (!legal || unknown.length === 0) continue;
-        if (targetMode && hitCount === 0) continue;
-
-        // Matching several unresolved hits and being one shot from a sink are
-        // much more valuable than a merely possible placement.
-        let weight = multiplicity;
-        if (hitCount > 0) weight *= 1 + 5 * hitCount * hitCount;
-        if (unknown.length === 1 && hitCount > 0) weight *= 3;
-
-        for (const [r, c] of unknown) {
-          const k = key(r, c);
-          density.set(k, density.get(k) + weight);
-        }
-      }
-    }
-    return density;
-  }
-
-  allPlacements(length) {
-    const out = [];
-    for (let r = 0; r < ROWS; r++) {
-      for (let c = 0; c <= COLS - length; c++) out.push(shipCells(r, c, length, "H"));
-    }
-    for (let r = 0; r <= ROWS - length; r++) {
-      for (let c = 0; c < COLS; c++) out.push(shipCells(r, c, length, "V"));
-    }
-    return out;
-  }
-}
-
-/* ---------------- BayesianAI ---------------- */
-
-const PARTICLE_TARGET = 3500;
-const PARTICLE_MIN = 300;
-const INITIAL_BUILD_BUDGET_MS = 700;
-const REFILL_BUDGET_MS = 180;
-const GIBBS_MOVES_PER_NEW_PARTICLE = 1;
-const LOOKAHEAD_CANDIDATES = 5;
-const LOOKAHEAD_WEIGHT = 0.16;
-const TARGET_ACTIVE_WEIGHT = 14.0;
-const TARGET_SINK_WEIGHT = 7.0;
-const TARGET_OCCUPANCY_WEIGHT = 0.12;
-const HUNT_INFORMATION_WEIGHT = 0.015;
-
-class BayesianAI {
-  constructor(fleetSizes, { historicalLayouts = [] } = {}) {
-    this.fleetSizes = fleetSizes ? [...fleetSizes] : [...STANDARD_FLEET_SIZES];
-    this.remainingSizes = [...this.fleetSizes];
-    this.resolvedSunkCells = new Set();
-    this.sunkShips = [];
-    this.sunkSignatures = new Set();
-
-    this.particles = null;
-    this.processedCells = new Set();
-    this.cachedSignature = null;
-    this.cachedScores = null;
-
-    this.historicalParticles = historicalLayouts
-      .map((layout) => {
-        try {
-          return layoutToParticle(layout);
-        } catch (error) {
-          return null;
-        }
-      })
-      .filter(Boolean)
-      .slice(-40);
-
-    // A smoothed cell-frequency prior still helps when the player changes a
-    // few ships and none of the exact historical layouts survives filtering.
-    this.historicalCellPrior = new Float64Array(CELL_COUNT);
-    if (this.historicalParticles.length) {
-      for (const particle of this.historicalParticles) {
-        for (const idx of particle.occupiedIndices) this.historicalCellPrior[idx] += 1;
-      }
-      const n = this.historicalParticles.length;
-      const baseline = STANDARD_FLEET_SIZES.reduce((a, b) => a + b, 0) / CELL_COUNT;
-      for (let i = 0; i < CELL_COUNT; i++) {
-        const empirical = this.historicalCellPrior[i] / n;
-        this.historicalCellPrior[i] = 0.85 * empirical + 0.15 * baseline;
-      }
-    }
-  }
-
-  recordShotResult({ sunkLength = null, sunkCells = null } = {}) {
-    if (!sunkLength || !Array.isArray(sunkCells)) {
-      this.cachedSignature = null;
-      this.cachedScores = null;
-      return;
-    }
-
-    const signature = normalizedCellSignature(sunkCells);
-    if (this.sunkSignatures.has(signature)) return;
-
-    const idx = this.remainingSizes.indexOf(sunkLength);
-    if (idx !== -1) this.remainingSizes.splice(idx, 1);
-    const copied = sunkCells.map(([r, c]) => [r, c]);
-    this.sunkShips.push(copied);
-    this.sunkSignatures.add(signature);
-    for (const [r, c] of copied) this.resolvedSunkCells.add(key(r, c));
-
-    if (this.particles) {
-      this.particles = this.particles.filter((particle) => this.particleMatchesSunkEvidence(particle));
-    }
-
-    this.cachedSignature = null;
-    this.cachedScores = null;
-  }
-
-  static boardSignature(board) {
-    let out = "";
-    for (let r = 0; r < ROWS; r++) {
-      for (let c = 0; c < COLS; c++) out += board[r][c] === "hit" ? "H" : board[r][c] === "miss" ? "M" : ".";
-    }
-    return out;
-  }
-
-  stateSignature(board) {
-    return `${BayesianAI.boardSignature(board)}|${[...this.sunkSignatures].sort().join(";")}|${this.remainingSizes
-      .slice()
-      .sort((a, b) => a - b)
-      .join(",")}`;
-  }
-
-  selectNextMove(board) {
-    const unknown = [];
-    for (let r = 0; r < ROWS; r++) {
-      for (let c = 0; c < COLS; c++) if (board[r][c] === null) unknown.push([r, c]);
-    }
-    if (!unknown.length) throw new Error("No legal moves remain.");
-
-    try {
-      const scores = this.computeScores(board);
-      let best = -Infinity;
-      let bestCells = [];
-      for (const [r, c] of unknown) {
-        const score = scores.get(key(r, c)) || 0;
-        if (score > best + 1e-12) {
-          best = score;
-          bestCells = [[r, c]];
-        } else if (Math.abs(score - best) <= 1e-12) {
-          bestCells.push([r, c]);
-        }
-      }
-      return choice(bestCells.length ? bestCells : unknown);
-    } catch (error) {
-      const fallback = new ProbabilityAI(this.remainingSizes);
-      fallback.resolvedSunkCells = new Set(this.resolvedSunkCells);
-      return fallback.selectNextMove(board);
-    }
-  }
-
+  /** Exposed so the UI can render a live heatmap of the AI's current thinking. */
   currentDensityMap(board) {
     try {
       return this.computeScores(board);
-    } catch (error) {
-      const fallback = new ProbabilityAI(this.remainingSizes);
-      fallback.resolvedSunkCells = new Set(this.resolvedSunkCells);
-      return fallback.currentDensityMap(board);
+    } catch (e) {
+      const d = new Map();
+      for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) d.set(key(r, c), 0);
+      return d;
     }
   }
 
   computeScores(board) {
-    const signature = this.stateSignature(board);
-    if (signature === this.cachedSignature && this.cachedScores) return this.cachedScores;
+    const signature = BayesianAI.signature(board);
+    if (signature === this.cachedSignature && this.cachedScores !== null) {
+      return this.cachedScores;
+    }
 
     const start = performance.now();
-    const evidence = this.collectEvidence(board);
 
     if (this.particles === null) {
-      this.particles = this.generateParticles(
-        evidence,
-        PARTICLE_TARGET,
-        start + INITIAL_BUILD_BUDGET_MS
-      );
-      // These particles already include all current evidence.
-      for (const k of evidence.hits) this.processedCells.add(k);
-      for (const k of evidence.misses) this.processedCells.add(k);
-    } else {
-      this.applyNewEvidence(board);
+      this.particles = this.generateParticles(new Set(), new Set(), this.particleTarget, start + this.resampleBudgetMs * 4);
     }
 
-    this.maybeRefill(evidence, start);
-
-    if (!this.particles.length) {
-      const fallback = new ProbabilityAI(this.remainingSizes);
-      fallback.resolvedSunkCells = new Set(this.resolvedSunkCells);
-      const scores = fallback.currentDensityMap(board);
-      this.cachedSignature = signature;
-      this.cachedScores = scores;
-      return scores;
-    }
-
-    const historical = this.historicalParticles.filter((particle) => this.particleConsistentWithBoard(particle, board));
-    const historyAlpha = historical.length
-      ? Math.min(0.48, 0.12 * Math.sqrt(Math.min(this.historicalParticles.length, 16)))
-      : 0;
-
-    const weightedParticles = [];
-    const genericWeight = (1 - historyAlpha) / this.particles.length;
-    for (const particle of this.particles) weightedParticles.push([particle, genericWeight]);
-    if (historical.length) {
-      const historyWeight = historyAlpha / historical.length;
-      for (const particle of historical) weightedParticles.push([particle, historyWeight]);
-    }
-
-    const occupancy = new Float64Array(CELL_COUNT);
-    const active = new Float64Array(CELL_COUNT);
-    const sink = new Float64Array(CELL_COUNT);
-    let hasActive = false;
-
-    for (const [particle, weight] of weightedParticles) {
-      for (const cells of particle.ships) {
-        if (this.sunkShips.length && cells.every(([r, c]) => this.resolvedSunkCells.has(key(r, c)))) continue;
-
-        let hitCount = 0;
-        const unknownIndices = [];
-        for (const [r, c] of cells) {
-          if (this.resolvedSunkCells.has(key(r, c))) continue;
-          if (board[r][c] === "hit") hitCount++;
-          else if (board[r][c] === null) unknownIndices.push(indexOfCell(r, c));
-        }
-
-        for (const idx of unknownIndices) occupancy[idx] += weight;
-        if (hitCount > 0 && unknownIndices.length > 0) {
-          hasActive = true;
-          for (const idx of unknownIndices) active[idx] += weight;
-          if (unknownIndices.length === 1) sink[unknownIndices[0]] += weight;
-        }
-      }
-    }
-
-    const base = new Float64Array(CELL_COUNT);
-    const candidateIndices = [];
-    for (let r = 0; r < ROWS; r++) {
-      for (let c = 0; c < COLS; c++) {
-        if (board[r][c] !== null) continue;
-        const idx = indexOfCell(r, c);
-        candidateIndices.push(idx);
-        if (hasActive) {
-          base[idx] =
-            TARGET_ACTIVE_WEIGHT * active[idx] +
-            TARGET_SINK_WEIGHT * sink[idx] +
-            TARGET_OCCUPANCY_WEIGHT * occupancy[idx];
-        } else {
-          const p = occupancy[idx];
-          const information = 4 * p * (1 - p);
-          const priorAlpha = this.historicalParticles.length
-            ? Math.min(0.18, 0.045 * Math.sqrt(this.historicalParticles.length))
-            : 0;
-          const learnedPrior = this.historicalCellPrior[idx] || p;
-          base[idx] = (1 - priorAlpha) * p + priorAlpha * learnedPrior + HUNT_INFORMATION_WEIGHT * information;
-        }
-      }
-    }
-
-    if (!hasActive && candidateIndices.length > 1) {
-      const top = [...candidateIndices]
-        .sort((a, b) => base[b] - base[a])
-        .slice(0, LOOKAHEAD_CANDIDATES);
-      for (const idx of top) {
-        base[idx] += LOOKAHEAD_WEIGHT * this.expectedNextHitProbability(idx, weightedParticles, board);
-      }
-    }
+    this.applyNewEvidence(board);
+    this.maybeResample(board, start);
 
     const scores = new Map();
-    for (let i = 0; i < CELL_COUNT; i++) {
-      const [r, c] = cellFromIndex(i);
-      scores.set(key(r, c), base[i]);
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) scores.set(key(r, c), 0);
+
+    if (this.particles.length === 0) {
+      const fallback = this.fallbackScores(board);
+      this.cachedSignature = signature;
+      this.cachedScores = fallback;
+      return fallback;
+    }
+
+    const n = this.particles.length;
+    const occupancy = new Map();
+    const activeShip = new Map();
+    const sink = new Map();
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        const k = key(r, c);
+        occupancy.set(k, 0);
+        activeShip.set(k, 0);
+        sink.set(k, 0);
+      }
+    }
+
+    for (const particle of this.particles) {
+      for (const cells of particle.ships) {
+        let hitCount = 0;
+        const unknownInShip = [];
+        for (const [r, c] of cells) {
+          const state = board[r][c];
+          if (state === "hit") hitCount++;
+          else if (state === null) unknownInShip.push([r, c]);
+        }
+        for (const [r, c] of unknownInShip) {
+          const k = key(r, c);
+          occupancy.set(k, occupancy.get(k) + 1);
+        }
+        if (hitCount > 0 && hitCount < cells.length) {
+          for (const [r, c] of unknownInShip) {
+            const k = key(r, c);
+            activeShip.set(k, activeShip.get(k) + 1);
+          }
+          if (unknownInShip.length === 1) {
+            const [r, c] = unknownInShip[0];
+            const k = key(r, c);
+            sink.set(k, sink.get(k) + 1);
+          }
+        }
+      }
+    }
+
+    let hasActive = false;
+    for (const v of activeShip.values()) {
+      if (v > 0) {
+        hasActive = true;
+        break;
+      }
+    }
+
+    for (const k of scores.keys()) {
+      const occ = occupancy.get(k) / n;
+      if (hasActive) {
+        const act = activeShip.get(k) / n;
+        const snk = sink.get(k) / n;
+        scores.set(k, W_ACTIVE_SHIP * act + W_SINK * snk + W_OCCUPANCY_TARGET * occ);
+      } else {
+        const infoGain = 4 * occ * (1 - occ);
+        scores.set(k, occ + W_INFO_GAIN_HUNT * infoGain);
+      }
     }
 
     this.cachedSignature = signature;
@@ -499,229 +437,201 @@ class BayesianAI {
     return scores;
   }
 
-  expectedNextHitProbability(shotIndex, weightedParticles, board) {
-    const hitCounts = new Float64Array(CELL_COUNT);
-    const missCounts = new Float64Array(CELL_COUNT);
-    let hitMass = 0;
-    let missMass = 0;
-    const shotKey = key(...cellFromIndex(shotIndex));
-
-    for (const [particle, weight] of weightedParticles) {
-      const isHit = particle.occupied.has(shotKey);
-      if (isHit) hitMass += weight;
-      else missMass += weight;
-
-      for (const idx of particle.occupiedIndices) {
-        const [r, c] = cellFromIndex(idx);
-        if (board[r][c] !== null || idx === shotIndex) continue;
-        if (isHit) hitCounts[idx] += weight;
-        else missCounts[idx] += weight;
-      }
-    }
-
-    let bestAfterHit = 0;
-    let bestAfterMiss = 0;
-    if (hitMass > 0) {
-      for (let i = 0; i < CELL_COUNT; i++) bestAfterHit = Math.max(bestAfterHit, hitCounts[i] / hitMass);
-    }
-    if (missMass > 0) {
-      for (let i = 0; i < CELL_COUNT; i++) bestAfterMiss = Math.max(bestAfterMiss, missCounts[i] / missMass);
-    }
-    return hitMass * bestAfterHit + missMass * bestAfterMiss;
+  lengthCounts() {
+    const counts = new Map();
+    for (const length of this.fleetSizes) counts.set(length, (counts.get(length) || 0) + 1);
+    return counts;
   }
 
-  collectEvidence(board) {
-    const misses = new Set();
-    const hits = new Set();
-    const blocked = new Set(this.resolvedSunkCells);
+  fallbackScores(board) {
+    const blocked = new Set();
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
-        const k = key(r, c);
-        if (board[r][c] === "miss") {
-          misses.add(k);
-          blocked.add(k);
-        } else if (board[r][c] === "hit" && !this.resolvedSunkCells.has(k)) {
-          hits.add(k);
+        if (board[r][c] === "miss") blocked.add(key(r, c));
+      }
+    }
+    const density = new Map();
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) density.set(key(r, c), 0);
+    // Weight each length by its multiplicity in the fleet -- the two
+    // length-3 ships must contribute twice as much placement mass as a
+    // single length, which iterating over new Set(fleetSizes) would miss.
+    for (const [length, count] of this.lengthCounts()) {
+      for (const cells of this.allValidPlacements(length, blocked)) {
+        const hasHit = cells.some(([r, c]) => board[r][c] === "hit");
+        const hasUnknown = cells.some(([r, c]) => board[r][c] === null);
+        if (hasHit && !hasUnknown) continue;
+        for (const [r, c] of cells) {
+          const k = key(r, c);
+          density.set(k, density.get(k) + count);
         }
       }
     }
-    return { misses, hits, blocked };
+    return density;
   }
+
+  /* ---------------- Particle maintenance ---------------- */
 
   applyNewEvidence(board) {
     const newHits = [];
     const newMisses = [];
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
-        if (board[r][c] === null) continue;
+        const state = board[r][c];
+        if (state === null) continue;
         const k = key(r, c);
         if (this.processedCells.has(k)) continue;
         this.processedCells.add(k);
-        if (board[r][c] === "hit") newHits.push(k);
-        else newMisses.push(k);
+        if (state === "hit") newHits.push(k);
+        else if (state === "miss") newMisses.push(k);
       }
     }
+    if (newHits.length === 0 && newMisses.length === 0) return;
 
-    if (!newHits.length && !newMisses.length) return;
-    this.particles = this.particles.filter((particle) => {
-      for (const k of newHits) if (!particle.occupied.has(k)) return false;
-      for (const k of newMisses) if (particle.occupied.has(k)) return false;
-      return this.particleMatchesSunkEvidence(particle);
+    this.particles = this.particles.filter((p) => {
+      for (const k of newHits) if (!p.occupied.has(k)) return false;
+      for (const k of newMisses) if (p.occupied.has(k)) return false;
+      return true;
     });
   }
 
-  maybeRefill(evidence, startTime) {
-    if (this.particles.length >= PARTICLE_MIN) return;
-    const fresh = this.generateParticles(
-      evidence,
-      PARTICLE_TARGET - this.particles.length,
-      startTime + REFILL_BUDGET_MS
-    );
+  maybeResample(board, startTime) {
+    if (this.particles.length >= this.particleMin) return;
+
+    const blocked = new Set();
+    const activeHits = new Set();
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        if (board[r][c] === "miss") blocked.add(key(r, c));
+        else if (board[r][c] === "hit") activeHits.add(key(r, c));
+      }
+    }
+
+    const deadline = startTime + this.resampleBudgetMs;
+    const fresh = this.generateParticles(blocked, activeHits, this.particleTarget - this.particles.length, deadline);
     this.particles = this.particles.concat(fresh);
   }
 
-  generateParticles(evidence, targetCount, deadline) {
+  generateParticles(blocked, activeHits, targetCount, deadline) {
     const validByLength = new Map();
-    for (const length of new Set(this.remainingSizes)) {
-      validByLength.set(length, this.allValidPlacements(length, evidence.blocked));
+    for (const length of new Set(this.fleetSizes)) {
+      validByLength.set(length, this.allValidPlacements(length, blocked));
     }
-
+    // Static (occupied-agnostic) count of how many placements of each length
+    // cover each cell -- used to order hit resolution "most constrained
+    // first" without recomputing candidate sets just to decide which hit to
+    // tackle. cover is Map(length -> Map(cellKey -> count)).
     const cover = new Map();
     for (const [length, placements] of validByLength) {
-      const counts = new Map();
+      const cc = new Map();
       for (const cells of placements) {
         for (const [r, c] of cells) {
           const k = key(r, c);
-          counts.set(k, (counts.get(k) || 0) + 1);
+          cc.set(k, (cc.get(k) || 0) + 1);
         }
       }
-      cover.set(length, counts);
+      cover.set(length, cc);
     }
 
     const particles = [];
-    const maxAttempts = Math.max(8000, targetCount * 18);
     let attempts = 0;
+    const maxAttempts = Math.max(targetCount * 25, 20000);
     while (particles.length < targetCount && attempts < maxAttempts) {
       attempts++;
-      if (attempts % 40 === 0 && performance.now() > deadline) break;
-      const ships = this.tryBuildParticle(evidence.hits, validByLength, cover);
-      if (!ships) continue;
-      const rejuvenated = this.rejuvenateShips(ships, evidence, validByLength, GIBBS_MOVES_PER_NEW_PARTICLE);
-      particles.push(this.makeParticle(rejuvenated));
+      if (attempts % 300 === 0 && performance.now() > deadline) break;
+      const ships = this.tryBuildParticle(activeHits, validByLength, cover);
+      if (ships !== null) particles.push(this.makeParticle(ships));
     }
     return particles;
   }
 
   tryBuildParticle(activeHits, validByLength, cover) {
-    const ships = this.sunkShips.map((cells) => cells.map(([r, c]) => [r, c]));
-    const occupied = new Set(this.resolvedSunkCells);
-    const remaining = [...this.remainingSizes];
+    const occupied = new Set();
+    const remaining = [...this.fleetSizes];
     const uncovered = new Set(activeHits);
+    const ships = [];
 
     while (uncovered.size > 0) {
-      let selectedHit = null;
-      let constraint = Infinity;
-      for (const candidate of uncovered) {
+      // Resolve the MOST CONSTRAINED hit first -- the uncovered hit
+      // reachable by the fewest legal ship placements (approximated cheaply
+      // from the static cover index, weighted by how many ships of each
+      // length remain). Committing to the hardest-to-satisfy hit early
+      // prunes dead-end partial configurations that a fixed "first hit"
+      // order would only discover after wasted work, cutting failed samples.
+      let h = null;
+      let hConstraint = Infinity;
+      for (const cand of uncovered) {
         let total = 0;
-        const multiplicities = new Map();
-        for (const length of remaining) multiplicities.set(length, (multiplicities.get(length) || 0) + 1);
-        for (const [length, count] of multiplicities) total += count * (cover.get(length)?.get(candidate) || 0);
-        if (total < constraint) {
-          constraint = total;
-          selectedHit = candidate;
+        for (const length of remaining) total += cover.get(length).get(cand) || 0;
+        if (total < hConstraint) {
+          hConstraint = total;
+          h = cand;
         }
       }
-      if (selectedHit === null) return null;
+      const [hr, hc] = h.split(",").map(Number);
 
-      const multiplicities = new Map();
-      for (const length of remaining) multiplicities.set(length, (multiplicities.get(length) || 0) + 1);
-      const candidates = [];
-      for (const [length, count] of multiplicities) {
-        for (const cells of validByLength.get(length) || []) {
-          if (!cells.some(([r, c]) => key(r, c) === selectedHit)) continue;
-          if (!this.cellsFree(cells, occupied)) continue;
-          const overlap = cells.reduce((sum, [r, c]) => sum + (uncovered.has(key(r, c)) ? 1 : 0), 0);
-          const weight = count * Math.pow(Math.max(1, overlap), 3);
-          candidates.push([length, cells, weight]);
+      const candidates = []; // [length, cells, weight]
+      for (const length of new Set(remaining)) {
+        for (const cells of validByLength.get(length)) {
+          if (cells.some(([r, c]) => r === hr && c === hc) && this.cellsFree(cells, occupied)) {
+            // Weight by (overlap with currently-uncovered hits)^2. Without
+            // this, a run of touching hits gets constructed as often via
+            // many separate ships each crossing it at a single cell as via
+            // the far more realistic single ship spanning the whole run --
+            // there are simply more (length, placement) pairs of the first
+            // kind, so uniform random choice over-samples them.
+            const overlap = cells.filter(([r, c]) => uncovered.has(key(r, c))).length;
+            candidates.push([length, cells, overlap * overlap]);
+          }
         }
       }
-      if (!candidates.length) return null;
-
+      if (candidates.length === 0) return null;
       const [length, cells] = this.weightedChoice(candidates);
-      ships.push(cells.map(([r, c]) => [r, c]));
-      for (const [r, c] of cells) {
-        occupied.add(key(r, c));
-        uncovered.delete(key(r, c));
-      }
+      for (const [r, c] of cells) occupied.add(key(r, c));
       remaining.splice(remaining.indexOf(length), 1);
+      for (const [r, c] of cells) uncovered.delete(key(r, c));
+      ships.push(cells);
     }
 
-    for (const length of shuffled(remaining)) {
-      const cells = this.pickLegalPlacement(validByLength.get(length) || [], occupied);
-      if (!cells) return null;
-      ships.push(cells.map(([r, c]) => [r, c]));
+    for (const length of remaining) {
+      const cells = this.pickFromPool(validByLength.get(length), occupied);
+      if (cells === null) return null;
       for (const [r, c] of cells) occupied.add(key(r, c));
+      ships.push(cells);
     }
 
     return ships;
   }
 
-  rejuvenateShips(ships, evidence, validByLength, moves) {
-    if (moves <= 0) return ships;
-    const out = ships.map((cells) => cells.map(([r, c]) => [r, c]));
-
-    for (let move = 0; move < moves; move++) {
-      const movable = [];
-      for (let i = 0; i < out.length; i++) {
-        if (!this.sunkSignatures.has(normalizedCellSignature(out[i]))) movable.push(i);
-      }
-      if (!movable.length) break;
-      const shipIndex = choice(movable);
-      const oldCells = out[shipIndex];
-      const length = oldCells.length;
-
-      const occupiedOthers = new Set(this.resolvedSunkCells);
-      for (let i = 0; i < out.length; i++) {
-        if (i === shipIndex) continue;
-        for (const [r, c] of out[i]) occupiedOthers.add(key(r, c));
-      }
-
-      const requiredHits = oldCells.filter(([r, c]) => evidence.hits.has(key(r, c)));
-      const legal = [];
-      for (const cells of validByLength.get(length) || []) {
-        if (!this.cellsFree(cells, occupiedOthers)) continue;
-        let coversRequired = true;
-        for (const [r, c] of requiredHits) {
-          if (!cells.some(([rr, cc]) => rr === r && cc === c)) {
-            coversRequired = false;
-            break;
-          }
-        }
-        if (coversRequired) legal.push(cells);
-      }
-      if (legal.length) out[shipIndex] = choice(legal).map(([r, c]) => [r, c]);
-    }
-    return out;
-  }
-
   weightedChoice(candidates) {
     let total = 0;
-    for (const [, , weight] of candidates) total += weight;
+    for (const [, , w] of candidates) total += w;
     let pick = Math.random() * total;
-    for (const [length, cells, weight] of candidates) {
-      pick -= weight;
+    for (const [length, cells, w] of candidates) {
+      pick -= w;
       if (pick <= 0) return [length, cells];
     }
-    const last = candidates[candidates.length - 1];
-    return [last[0], last[1]];
+    return [candidates[candidates.length - 1][0], candidates[candidates.length - 1][1]];
   }
 
-  pickLegalPlacement(pool, occupied) {
-    if (!pool.length) return null;
-    for (let i = 0; i < Math.min(48, pool.length); i++) {
-      const cells = pool[randInt(pool.length)];
+  makeParticle(ships) {
+    const occupied = new Set();
+    for (const cells of ships) for (const [r, c] of cells) occupied.add(key(r, c));
+    return { ships, occupied };
+  }
+
+  pickFromPool(pool, occupied, quickTries = this.poolPickAttempts) {
+    const n = pool.length;
+    if (n === 0) return null;
+    // Fast path: a few random draws. When the pool is mostly free (early
+    // game) this almost always succeeds immediately and avoids scanning the
+    // whole pool. Rejection sampling like this is uniform over legal cells.
+    for (let i = 0; i < Math.min(quickTries, n); i++) {
+      const cells = pool[randInt(n)];
       if (this.cellsFree(cells, occupied)) return cells;
     }
+    // Correctness path: exhaustively collect legal placements so we never
+    // return null while a legal placement still exists (late game, when
+    // most of the pool is blocked). Also uniform over legal.
     const legal = pool.filter((cells) => this.cellsFree(cells, occupied));
     return legal.length ? choice(legal) : null;
   }
@@ -730,205 +640,715 @@ class BayesianAI {
     const placements = [];
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c <= COLS - length; c++) {
-        const cells = shipCells(r, c, length, "H");
+        const cells = [];
+        for (let i = 0; i < length; i++) cells.push([r, c + i]);
         if (this.cellsFree(cells, blocked)) placements.push(cells);
       }
     }
     for (let r = 0; r <= ROWS - length; r++) {
       for (let c = 0; c < COLS; c++) {
-        const cells = shipCells(r, c, length, "V");
+        const cells = [];
+        for (let i = 0; i < length; i++) cells.push([r + i, c]);
         if (this.cellsFree(cells, blocked)) placements.push(cells);
       }
     }
     return placements;
   }
 
-  cellsFree(cells, blocker) {
-    for (const [r, c] of cells) if (blocker.has(key(r, c))) return false;
-    return true;
-  }
-
-  makeParticle(ships) {
-    const occupied = new Set();
-    const occupiedIndices = [];
-    const shipSignatures = ships.map((cells) => normalizedCellSignature(cells));
-    for (const cells of ships) {
-      for (const [r, c] of cells) {
-        occupied.add(key(r, c));
-        occupiedIndices.push(indexOfCell(r, c));
-      }
-    }
-    return { ships, shipSignatures, occupied, occupiedIndices };
-  }
-
-  particleMatchesSunkEvidence(particle) {
-    for (const signature of this.sunkSignatures) {
-      if (!particle.shipSignatures.includes(signature)) return false;
-    }
-    return true;
-  }
-
-  particleConsistentWithBoard(particle, board) {
-    if (!this.particleMatchesSunkEvidence(particle)) return false;
-    for (let r = 0; r < ROWS; r++) {
-      for (let c = 0; c < COLS; c++) {
-        const state = board[r][c];
-        if (state === null) continue;
-        const occupied = particle.occupied.has(key(r, c));
-        if (state === "hit" && !occupied) return false;
-        if (state === "miss" && occupied) return false;
+  cellsFree(cells, ...blockers) {
+    for (const [r, c] of cells) {
+      const k = key(r, c);
+      for (const blocker of blockers) {
+        if (blocker.has(k)) return false;
       }
     }
     return true;
   }
 }
 
+/* ---------------- POMCPAI ---------------- */
+
+/*
+ * Research-inspired online planner based on POMCP (Partially Observable
+ * Monte-Carlo Planning). Battleship is naturally a POMDP: the hidden state is
+ * the complete enemy fleet, an action is a shot, and the observation is
+ * miss/hit/sunk. POMCP samples a possible hidden fleet at the root of each
+ * simulation and uses UCT/PUCT tree search over future action-observation
+ * histories. This implementation is specialized for the 8x11 board and uses
+ * a compact particle belief plus exact sunk-ship announcements from app.js.
+ *
+ * It deliberately keeps a separate class instead of replacing BayesianAI so
+ * the benchmark can compare a greedy posterior policy with an online planner.
+ */
+
+const POMCP_CELL_BITS = Array.from({ length: ROWS * COLS }, (_, i) => 1n << BigInt(i));
+const POMCP_FULL_MASK = (1n << BigInt(ROWS * COLS)) - 1n;
+const POMCP_PLACEMENTS = new Map();
+
+function pomcpIndex(r, c) {
+  return r * COLS + c;
+}
+
+function pomcpMaskFromCells(cells) {
+  let mask = 0n;
+  for (const [r, c] of cells) mask |= POMCP_CELL_BITS[pomcpIndex(r, c)];
+  return mask;
+}
+
+function pomcpPopcount(mask) {
+  let n = 0;
+  while (mask) {
+    mask &= mask - 1n;
+    n++;
+  }
+  return n;
+}
+
+function pomcpPlacements(length) {
+  if (POMCP_PLACEMENTS.has(length)) return POMCP_PLACEMENTS.get(length);
+  const out = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c <= COLS - length; c++) {
+      const cells = shipCells(r, c, length, "H");
+      out.push({ r, c, length, orientation: "H", cells, indices: cells.map(([rr, cc]) => pomcpIndex(rr, cc)), mask: pomcpMaskFromCells(cells) });
+    }
+  }
+  for (let r = 0; r <= ROWS - length; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const cells = shipCells(r, c, length, "V");
+      out.push({ r, c, length, orientation: "V", cells, indices: cells.map(([rr, cc]) => pomcpIndex(rr, cc)), mask: pomcpMaskFromCells(cells) });
+    }
+  }
+  POMCP_PLACEMENTS.set(length, out);
+  return out;
+}
+
+class POMCPAI {
+  constructor(fleetSizes, options = {}) {
+    this.fleetSizes = fleetSizes ? [...fleetSizes] : [...STANDARD_FLEET_SIZES];
+    this.options = {
+      particles: options.particles ?? 500,
+      minParticles: options.minParticles ?? 75,
+      simulations: options.simulations ?? 36,
+      horizon: options.horizon ?? 6,
+      rootCandidates: options.rootCandidates ?? 12,
+      nodeCandidates: options.nodeCandidates ?? 8,
+      exploration: options.exploration ?? 1.25,
+      maxNodeParticles: options.maxNodeParticles ?? 40,
+      generationAttempts: options.generationAttempts ?? 14,
+    };
+
+    this.particles = [];
+    this.sunkEvents = []; // [{length, mask, indices}]
+    this.cachedSignature = null;
+    this.cachedScores = null;
+    this.lastBoardMasks = null;
+    this.lastSearchStats = null;
+  }
+
+  /* Fast settings used by the 100-200 game browser benchmark. */
+  static benchmark(fleetSizes) {
+    return new POMCPAI(fleetSizes, {
+      particles: 140,
+      minParticles: 18,
+      simulations: 10,
+      horizon: 3,
+      rootCandidates: 8,
+      nodeCandidates: 5,
+      maxNodeParticles: 16,
+      generationAttempts: 5,
+    });
+  }
+
+  /* app.js calls this after the result is known. Exact sunk information is a
+   * legal Battleship observation and sharply improves the posterior. */
+  recordShotResult({ sunkLength = null, sunkCells = null } = {}) {
+    if (!sunkLength || !Array.isArray(sunkCells) || sunkCells.length === 0) return;
+    const indices = sunkCells.map(([r, c]) => pomcpIndex(r, c)).sort((a, b) => a - b);
+    let mask = 0n;
+    for (const idx of indices) mask |= POMCP_CELL_BITS[idx];
+    if (this.sunkEvents.some((e) => e.mask === mask)) return;
+    this.sunkEvents.push({ length: sunkLength, mask, indices });
+    this.cachedSignature = null;
+    this.cachedScores = null;
+  }
+
+  static signature(board, sunkEvents) {
+    let s = "";
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        s += board[r][c] === "hit" ? "H" : board[r][c] === "miss" ? "M" : ".";
+      }
+    }
+    if (sunkEvents.length) s += "|" + sunkEvents.map((e) => `${e.length}:${e.mask.toString(16)}`).sort().join(";");
+    return s;
+  }
+
+  boardMasks(board) {
+    let hitMask = 0n;
+    let missMask = 0n;
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        const idx = pomcpIndex(r, c);
+        if (board[r][c] === "hit") hitMask |= POMCP_CELL_BITS[idx];
+        else if (board[r][c] === "miss") missMask |= POMCP_CELL_BITS[idx];
+      }
+    }
+    let sunkMask = 0n;
+    for (const e of this.sunkEvents) sunkMask |= e.mask;
+    return { hitMask, missMask, shotMask: hitMask | missMask, sunkMask };
+  }
+
+  selectNextMove(board) {
+    const unknown = [];
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) if (board[r][c] === null) unknown.push(pomcpIndex(r, c));
+    }
+    if (unknown.length === 0) throw new Error("No legal moves remain: board is full.");
+
+    try {
+      const { scores, masks } = this.prepareBelief(board);
+      const ranked = unknown.sort((a, b) => scores[b] - scores[a]);
+      const candidates = ranked.slice(0, Math.min(this.options.rootCandidates, ranked.length));
+      if (candidates.length === 1 || this.particles.length < 2) {
+        const idx = candidates[0] ?? choice(unknown);
+        return [Math.floor(idx / COLS), idx % COLS];
+      }
+
+      const root = this.makeNode(candidates, scores, this.particles);
+      for (let i = 0; i < this.options.simulations; i++) {
+        const particle = this.particles[randInt(this.particles.length)];
+        const simState = {
+          hitMask: masks.hitMask,
+          missMask: masks.missMask,
+          shotMask: masks.shotMask,
+          sunkMasks: new Set(this.sunkEvents.map((e) => e.mask.toString())),
+        };
+        this.simulate(root, particle, simState, this.options.horizon);
+      }
+
+      let best = candidates[0];
+      let bestVisits = -1;
+      let bestQ = -Infinity;
+      for (const idx of candidates) {
+        const stat = root.actions.get(idx);
+        if (stat.n > bestVisits || (stat.n === bestVisits && stat.q > bestQ)) {
+          best = idx;
+          bestVisits = stat.n;
+          bestQ = stat.q;
+        }
+      }
+      this.lastSearchStats = { simulations: root.n, action: best, visits: bestVisits, value: bestQ };
+      return [Math.floor(best / COLS), best % COLS];
+    } catch (e) {
+      const idx = choice(unknown);
+      return [Math.floor(idx / COLS), idx % COLS];
+    }
+  }
+
+  currentDensityMap(board) {
+    try {
+      const { scores } = this.prepareBelief(board);
+      const map = new Map();
+      for (let idx = 0; idx < ROWS * COLS; idx++) map.set(key(Math.floor(idx / COLS), idx % COLS), scores[idx]);
+      return map;
+    } catch (e) {
+      const map = new Map();
+      for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) map.set(key(r, c), 0);
+      return map;
+    }
+  }
+
+  prepareBelief(board) {
+    const signature = POMCPAI.signature(board, this.sunkEvents);
+    if (signature === this.cachedSignature && this.cachedScores !== null && this.lastBoardMasks !== null) {
+      return { scores: this.cachedScores, masks: this.lastBoardMasks };
+    }
+
+    const masks = this.boardMasks(board);
+    this.filterParticles(masks);
+    if (this.particles.length < this.options.minParticles) this.replenishParticles(masks);
+    if (this.particles.length === 0) this.replenishParticles(masks, true);
+
+    const scores = this.scoreBelief(this.particles, masks, this.options.rootCandidates);
+    this.cachedSignature = signature;
+    this.cachedScores = scores;
+    this.lastBoardMasks = masks;
+    return { scores, masks };
+  }
+
+  filterParticles(masks) {
+    if (this.particles.length === 0) return;
+    const eventByMask = new Set(this.sunkEvents.map((e) => e.mask.toString()));
+    this.particles = this.particles.filter((p) => {
+      if ((p.occupied & masks.missMask) !== 0n) return false;
+      if ((p.occupied & masks.hitMask) !== masks.hitMask) return false;
+      for (const e of this.sunkEvents) {
+        if (!p.ships.some((ship) => ship.length === e.length && ship.mask === e.mask)) return false;
+      }
+      // Negative information matters too: if a hypothetical ship is already
+      // fully hit, the game would have announced it sunk. Reject it unless it
+      // is one of the exact announced sunk ships.
+      for (const ship of p.ships) {
+        if ((ship.mask & masks.hitMask) === ship.mask && !eventByMask.has(ship.mask.toString())) return false;
+      }
+      return true;
+    });
+  }
+
+  replenishParticles(masks, forceFull = false) {
+    const target = forceFull ? this.options.particles : this.options.particles - this.particles.length;
+    if (target <= 0) return;
+    const fresh = this.generateParticles(masks, target);
+    this.particles = forceFull ? fresh : this.particles.concat(fresh);
+  }
+
+  generateParticles(masks, targetCount) {
+    const fixedShips = [];
+    const remaining = [...this.fleetSizes];
+    let fixedOccupied = 0n;
+
+    for (const e of this.sunkEvents) {
+      const idx = remaining.indexOf(e.length);
+      if (idx === -1) return [];
+      remaining.splice(idx, 1);
+      const placement = pomcpPlacements(e.length).find((p) => p.mask === e.mask);
+      if (!placement || (placement.mask & fixedOccupied) !== 0n) return [];
+      fixedShips.push(placement);
+      fixedOccupied |= placement.mask;
+    }
+
+    const pools = new Map();
+    for (const length of new Set(remaining)) {
+      pools.set(
+        length,
+        pomcpPlacements(length).filter((p) => (p.mask & masks.missMask) === 0n && (p.mask & fixedOccupied) === 0n)
+      );
+    }
+
+    const activeHits = masks.hitMask & ~fixedOccupied;
+    const out = [];
+    const maxAttempts = Math.max(targetCount * this.options.generationAttempts, 800);
+
+    for (let attempt = 0; attempt < maxAttempts && out.length < targetCount; attempt++) {
+      const ships = fixedShips.slice();
+      const sizes = remaining.slice();
+      let occupied = fixedOccupied;
+      let uncovered = activeHits;
+      let failed = false;
+
+      while (uncovered !== 0n && !failed) {
+        let chosenBit = -1;
+        let minChoices = Infinity;
+        for (let idx = 0; idx < ROWS * COLS; idx++) {
+          const bit = POMCP_CELL_BITS[idx];
+          if ((uncovered & bit) === 0n) continue;
+          let count = 0;
+          for (const length of new Set(sizes)) {
+            for (const p of pools.get(length) || []) {
+              if ((p.mask & bit) !== 0n && (p.mask & occupied) === 0n) count++;
+            }
+          }
+          if (count < minChoices) {
+            minChoices = count;
+            chosenBit = idx;
+          }
+        }
+        if (chosenBit < 0 || minChoices === 0) {
+          failed = true;
+          break;
+        }
+
+        const bit = POMCP_CELL_BITS[chosenBit];
+        const candidates = [];
+        let totalWeight = 0;
+        for (const length of new Set(sizes)) {
+          const multiplicity = sizes.filter((x) => x === length).length;
+          for (const p of pools.get(length) || []) {
+            if ((p.mask & bit) === 0n || (p.mask & occupied) !== 0n) continue;
+            const overlap = pomcpPopcount(p.mask & uncovered);
+            const weight = multiplicity * overlap * overlap;
+            candidates.push([p, weight]);
+            totalWeight += weight;
+          }
+        }
+        if (candidates.length === 0) {
+          failed = true;
+          break;
+        }
+        let pick = Math.random() * totalWeight;
+        let selected = candidates[candidates.length - 1][0];
+        for (const [p, w] of candidates) {
+          pick -= w;
+          if (pick <= 0) {
+            selected = p;
+            break;
+          }
+        }
+        ships.push(selected);
+        occupied |= selected.mask;
+        uncovered &= ~selected.mask;
+        sizes.splice(sizes.indexOf(selected.length), 1);
+      }
+
+      if (failed) continue;
+
+      // Most constrained remaining length first reduces dead ends.
+      while (sizes.length && !failed) {
+        let bestLength = sizes[0];
+        let bestLegal = null;
+        for (const length of new Set(sizes)) {
+          const legal = (pools.get(length) || []).filter((p) => (p.mask & occupied) === 0n);
+          if (bestLegal === null || legal.length < bestLegal.length) {
+            bestLength = length;
+            bestLegal = legal;
+          }
+        }
+        if (!bestLegal || bestLegal.length === 0) {
+          failed = true;
+          break;
+        }
+        const selected = bestLegal[randInt(bestLegal.length)];
+        ships.push(selected);
+        occupied |= selected.mask;
+        sizes.splice(sizes.indexOf(bestLength), 1);
+      }
+
+      if (!failed) out.push({ ships, occupied });
+    }
+    return out;
+  }
+
+  /* Returns one score per board cell. The same posterior scoring is used as
+   * a rollout policy and as a prior for PUCT. */
+  scoreBelief(particles, masks) {
+    const scores = new Float64Array(ROWS * COLS);
+    if (!particles || particles.length === 0) return scores;
+    const occ = new Uint32Array(ROWS * COLS);
+    const active = new Uint32Array(ROWS * COLS);
+    const sink = new Uint32Array(ROWS * COLS);
+    const sunkSet = masks.sunkMasks instanceof Set ? masks.sunkMasks : new Set(this.sunkEvents.map((e) => e.mask.toString()));
+
+    for (const particle of particles) {
+      for (const ship of particle.ships) {
+        if (sunkSet.has(ship.mask.toString())) continue;
+        let hitCount = 0;
+        const unknown = [];
+        for (const idx of ship.indices) {
+          const bit = POMCP_CELL_BITS[idx];
+          if ((masks.hitMask & bit) !== 0n) hitCount++;
+          else if ((masks.shotMask & bit) === 0n) unknown.push(idx);
+        }
+        for (const idx of unknown) occ[idx]++;
+        if (hitCount > 0 && unknown.length > 0) {
+          for (const idx of unknown) active[idx]++;
+          if (unknown.length === 1) sink[unknown[0]]++;
+        }
+      }
+    }
+
+    let hasActive = false;
+    for (let i = 0; i < active.length; i++) if (active[i] > 0) { hasActive = true; break; }
+    const n = particles.length;
+    for (let idx = 0; idx < scores.length; idx++) {
+      if ((masks.shotMask & POMCP_CELL_BITS[idx]) !== 0n) {
+        scores[idx] = -Infinity;
+        continue;
+      }
+      const p = occ[idx] / n;
+      if (hasActive) {
+        scores[idx] = 8.0 * (active[idx] / n) + 4.0 * (sink[idx] / n) + 0.75 * p;
+      } else {
+        const information = 4 * p * (1 - p);
+        scores[idx] = p + 0.12 * information;
+      }
+    }
+    return scores;
+  }
+
+  makeNode(candidates, scores, particles = []) {
+    const actions = new Map();
+    let priorTotal = 0;
+    const raw = [];
+    for (const idx of candidates) {
+      const value = Math.max(1e-6, Number.isFinite(scores[idx]) ? scores[idx] : 0);
+      raw.push([idx, value]);
+      priorTotal += value;
+    }
+    for (const [idx, value] of raw) {
+      actions.set(idx, { n: 0, q: 0, prior: value / priorTotal, children: new Map() });
+    }
+    const seed = [];
+    if (particles.length <= this.options.maxNodeParticles) {
+      seed.push(...particles);
+    } else {
+      const used = new Set();
+      while (seed.length < this.options.maxNodeParticles) {
+        const i = randInt(particles.length);
+        if (used.has(i)) continue;
+        used.add(i);
+        seed.push(particles[i]);
+      }
+    }
+    return { n: 0, actions, particles: seed };
+  }
+
+  particleConsistentWithState(particle, state) {
+    if ((particle.occupied & state.missMask) !== 0n) return false;
+    if ((particle.occupied & state.hitMask) !== state.hitMask) return false;
+    for (const sunk of state.sunkMasks) {
+      const mask = BigInt(sunk);
+      if (!particle.ships.some((ship) => ship.mask === mask)) return false;
+    }
+    for (const ship of particle.ships) {
+      if ((ship.mask & state.hitMask) === ship.mask && !state.sunkMasks.has(ship.mask.toString())) return false;
+    }
+    return true;
+  }
+
+  sampleBeliefForState(state, target = this.options.maxNodeParticles) {
+    const out = [];
+    if (this.particles.length === 0) return out;
+    const maxTries = Math.min(this.particles.length * 2, target * 20);
+    const seen = new Set();
+    for (let tries = 0; tries < maxTries && out.length < target; tries++) {
+      const i = randInt(this.particles.length);
+      if (seen.has(i)) continue;
+      seen.add(i);
+      const p = this.particles[i];
+      if (this.particleConsistentWithState(p, state)) out.push(p);
+    }
+    if (out.length < Math.min(8, target)) {
+      for (let i = 0; i < this.particles.length && out.length < target; i++) {
+        if (seen.has(i)) continue;
+        const p = this.particles[i];
+        if (this.particleConsistentWithState(p, state)) out.push(p);
+      }
+    }
+    return out;
+  }
+
+  simulate(node, trueParticle, state, depth) {
+    if (depth <= 0 || (trueParticle.occupied & ~state.shotMask) === 0n) {
+      return this.leafValue(node.particles, trueParticle, state);
+    }
+
+    if (node.particles.length < this.options.maxNodeParticles) node.particles.push(trueParticle);
+    if (node.actions.size === 0) {
+      const scores = this.scoreBelief(node.particles.length ? node.particles : [trueParticle], {
+        hitMask: state.hitMask,
+        missMask: state.missMask,
+        shotMask: state.shotMask,
+        sunkMask: 0n,
+        sunkMasks: state.sunkMasks,
+      });
+      const candidates = [];
+      for (let idx = 0; idx < ROWS * COLS; idx++) if ((state.shotMask & POMCP_CELL_BITS[idx]) === 0n) candidates.push(idx);
+      candidates.sort((a, b) => scores[b] - scores[a]);
+      const fresh = this.makeNode(candidates.slice(0, this.options.nodeCandidates), scores, node.particles);
+      node.actions = fresh.actions;
+    }
+
+    let selectedIdx = null;
+    let selectedStat = null;
+    let best = -Infinity;
+    const sqrtN = Math.sqrt(node.n + 1);
+    for (const [idx, stat] of node.actions) {
+      if ((state.shotMask & POMCP_CELL_BITS[idx]) !== 0n) continue;
+      const u = stat.q + this.options.exploration * stat.prior * sqrtN / (1 + stat.n);
+      if (u > best) {
+        best = u;
+        selectedIdx = idx;
+        selectedStat = stat;
+      }
+    }
+    if (selectedIdx === null) return this.leafValue(node.particles, trueParticle, state);
+
+    const { observation, nextState, immediate } = this.stepParticle(trueParticle, state, selectedIdx);
+    let child = selectedStat.children.get(observation);
+    let future;
+    if (!child) {
+      child = { n: 0, actions: new Map(), particles: [] };
+      selectedStat.children.set(observation, child);
+      future = this.rollout(child, trueParticle, nextState, depth - 1);
+    } else {
+      future = this.simulate(child, trueParticle, nextState, depth - 1);
+    }
+    const value = immediate + future;
+
+    node.n++;
+    selectedStat.n++;
+    selectedStat.q += (value - selectedStat.q) / selectedStat.n;
+    return value;
+  }
+
+  rollout(node, trueParticle, state, depth) {
+    let value = 0;
+    let current = state;
+    for (let d = 0; d < depth; d++) {
+      if ((trueParticle.occupied & ~current.shotMask) === 0n) return value;
+      if (node.particles.length < this.options.maxNodeParticles) node.particles.push(trueParticle);
+      const belief = node.particles.length ? node.particles : [trueParticle];
+      const scores = this.scoreBelief(belief, {
+        hitMask: current.hitMask,
+        missMask: current.missMask,
+        shotMask: current.shotMask,
+        sunkMask: 0n,
+        sunkMasks: current.sunkMasks,
+      });
+      let bestIdx = -1;
+      let bestScore = -Infinity;
+      for (let idx = 0; idx < scores.length; idx++) {
+        if (scores[idx] > bestScore) {
+          bestScore = scores[idx];
+          bestIdx = idx;
+        }
+      }
+      if (bestIdx < 0) break;
+      const step = this.stepParticle(trueParticle, current, bestIdx);
+      value += step.immediate;
+      current = step.nextState;
+    }
+    return value + this.leafValue(node.particles, trueParticle, current);
+  }
+
+  stepParticle(particle, state, idx) {
+    const bit = POMCP_CELL_BITS[idx];
+    const hit = (particle.occupied & bit) !== 0n;
+    const nextState = {
+      hitMask: state.hitMask,
+      missMask: state.missMask,
+      shotMask: state.shotMask | bit,
+      sunkMasks: new Set(state.sunkMasks),
+    };
+    let observation = "M";
+    let immediate = -1;
+
+    if (hit) {
+      nextState.hitMask |= bit;
+      observation = "H";
+      immediate += 1.2; // finite-horizon shaping: reward progress toward terminal
+      const ship = particle.ships.find((s) => (s.mask & bit) !== 0n);
+      if (ship && (ship.mask & nextState.hitMask) === ship.mask && !nextState.sunkMasks.has(ship.mask.toString())) {
+        nextState.sunkMasks.add(ship.mask.toString());
+        observation = `S${ship.length}:${ship.mask.toString(16)}`;
+        immediate += 2.2;
+      }
+    } else {
+      nextState.missMask |= bit;
+    }
+
+    if ((particle.occupied & ~nextState.shotMask) === 0n) immediate += 12;
+    return { observation, nextState, immediate };
+  }
+
+  leafValue(belief, trueParticle, state) {
+    const remaining = pomcpPopcount(trueParticle.occupied & ~state.shotMask);
+    if (remaining === 0) return 0;
+    if (!belief || belief.length === 0) return -remaining;
+
+    // Estimate search difficulty from the best posterior hit probability.
+    const scores = this.scoreBelief(belief, {
+      hitMask: state.hitMask,
+      missMask: state.missMask,
+      shotMask: state.shotMask,
+      sunkMask: 0n,
+      sunkMasks: state.sunkMasks,
+    });
+    let best = 0;
+    for (const s of scores) if (Number.isFinite(s) && s > best) best = s;
+    const effectiveP = Math.max(0.18, Math.min(1, best));
+    return -remaining / effectiveP;
+  }
+}
+
+
 /* ---------------- PlacementAI ---------------- */
 
+// Pool of pre-optimized, structurally-diverse layouts produced offline by
+// optimize_placement.py and shipped as layouts.json. Loaded once at startup
+// (see loadOptimizedLayouts). Each layout is an array of
+// {r, c, length, orientation}. Stays null if the file is missing/unreachable,
+// in which case PlacementAI falls back to a live game-based search.
 let OPTIMIZED_LAYOUTS = null;
 
 async function loadOptimizedLayouts(url = "layouts.json") {
   try {
-    const response = await fetch(url, { cache: "no-store" });
-    if (!response.ok) throw new Error(`Could not load ${url}`);
-    const data = await response.json();
-    const layouts = (data.layouts || []).map((layout) =>
+    const resp = await fetch(url);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    OPTIMIZED_LAYOUTS = (data.layouts || []).map((layout) =>
       layout.map(([r, c, length, orientation]) => ({ r, c, length, orientation }))
     );
-    OPTIMIZED_LAYOUTS = layouts.filter((layout) => PlacementAI.isLegalLayout(layout));
-  } catch (error) {
+  } catch (e) {
+    // No optimized pool available (e.g. opened via file:// where fetch is
+    // blocked, or the file was never generated). Live search will be used.
     OPTIMIZED_LAYOUTS = null;
   }
-  return OPTIMIZED_LAYOUTS;
 }
 
 class PlacementAI {
-  constructor({ restarts = 40, gamesPerCandidate = 6, shotHistory = [], usedLayouts = [] } = {}) {
+  constructor({ restarts = 10, gamesPerCandidate = 3 } = {}) {
     this.restarts = restarts;
     this.gamesPerCandidate = gamesPerCandidate;
-    this.shotHistory = shotHistory.filter(Array.isArray).slice(-30);
-    this.usedLayouts = usedLayouts.filter(Array.isArray).slice(-20);
   }
 
   placeShips(fleetSizes) {
     const sizes = fleetSizes ? [...fleetSizes] : [...STANDARD_FLEET_SIZES];
-    const pool = this.matchingOptimizedLayouts(sizes);
-    if (pool.length) return this.chooseAdaptiveLayout(pool);
+
+    // Mixed strategy: if the offline-optimized diverse pool is loaded, pick
+    // one of those layouts at random. Never reusing a single "best" layout
+    // keeps placement unpredictable to a repeat human opponent while every
+    // option is individually strong.
+    if (OPTIMIZED_LAYOUTS && OPTIMIZED_LAYOUTS.length) {
+      const wanted = [...sizes].sort((a, b) => a - b).join(",");
+      const matching = OPTIMIZED_LAYOUTS.filter(
+        (lay) => lay.map((s) => s.length).sort((a, b) => a - b).join(",") === wanted
+      );
+      if (matching.length) return choice(matching).map((s) => ({ ...s }));
+    }
 
     let bestLayout = null;
-    let bestScore = -Infinity;
+    let bestAvg = -Infinity;
     for (let i = 0; i < this.restarts; i++) {
       const layout = this.randomLegalLayout(sizes);
       if (!layout) continue;
-      const score = this.evaluate(layout, sizes) + 0.8 * this.historySurvivalScore(layout);
-      if (score > bestScore) {
-        bestScore = score;
+      const avg = this.evaluate(layout, sizes);
+      if (avg > bestAvg) {
+        bestAvg = avg;
         bestLayout = layout;
       }
     }
-    if (!bestLayout) throw new Error("Could not find a legal ship layout.");
+    if (!bestLayout) throw new Error("Could not find a legal ship layout");
     return bestLayout;
-  }
-
-  matchingOptimizedLayouts(sizes) {
-    if (!OPTIMIZED_LAYOUTS?.length) return [];
-    const wanted = [...sizes].sort((a, b) => a - b).join(",");
-    return OPTIMIZED_LAYOUTS.filter(
-      (layout) => layout.map((ship) => ship.length).sort((a, b) => a - b).join(",") === wanted
-    );
-  }
-
-  chooseAdaptiveLayout(pool) {
-    const scored = pool.map((layout) => {
-      const history = this.historySurvivalScore(layout);
-      const novelty = this.noveltyScore(layout);
-      return { layout, score: history + 3.5 * novelty + Math.random() * 1.5 };
-    });
-
-    scored.sort((a, b) => b.score - a.score);
-    const elite = scored.slice(0, Math.max(8, Math.ceil(scored.length * 0.25)));
-
-    // Softmax sampling keeps a mixed strategy while favoring layouts that
-    // specifically resist this player's previous firing patterns.
-    const floor = elite[elite.length - 1].score;
-    const weights = elite.map((entry) => Math.exp((entry.score - floor) / 4));
-    let pick = Math.random() * weights.reduce((a, b) => a + b, 0);
-    for (let i = 0; i < elite.length; i++) {
-      pick -= weights[i];
-      if (pick <= 0) return elite[i].layout.map((ship) => ({ ...ship }));
-    }
-    return elite[0].layout.map((ship) => ({ ...ship }));
-  }
-
-  historySurvivalScore(layout) {
-    if (!this.shotHistory.length) return 0;
-    const shipCellsSet = this.shipCellSet(layout);
-    const survivals = [];
-
-    for (const order of this.shotHistory) {
-      const rank = new Map();
-      order.forEach(([r, c], i) => rank.set(key(r, c), i + 1));
-      let lastHit = 0;
-      for (const k of shipCellsSet) {
-        const fallback = Math.min(CELL_COUNT, order.length + 12);
-        lastHit = Math.max(lastHit, rank.get(k) || fallback);
-      }
-      survivals.push(lastHit);
-    }
-
-    survivals.sort((a, b) => a - b);
-    const average = survivals.reduce((a, b) => a + b, 0) / survivals.length;
-    const lowerQuartile = survivals[Math.floor((survivals.length - 1) * 0.25)];
-    return 0.7 * average + 0.3 * lowerQuartile;
-  }
-
-  noveltyScore(layout) {
-    if (!this.usedLayouts.length) return 1;
-    const cells = this.shipCellSet(layout);
-    let maxSimilarity = 0;
-    for (const oldLayout of this.usedLayouts) {
-      const oldCells = this.shipCellSet(oldLayout);
-      let overlap = 0;
-      for (const k of cells) if (oldCells.has(k)) overlap++;
-      maxSimilarity = Math.max(maxSimilarity, overlap / cells.size);
-    }
-    return 1 - maxSimilarity;
   }
 
   evaluate(layout, sizes) {
     const ships = this.shipCellSet(layout);
     let total = 0;
-    for (let i = 0; i < this.gamesPerCandidate; i++) total += this.simulateGame(ships, layout, sizes);
+    for (let i = 0; i < this.gamesPerCandidate; i++) total += this.simulateGame(ships, sizes);
     return total / this.gamesPerCandidate;
   }
 
-  simulateGame(ships, layout, sizes) {
+  simulateGame(ships, sizes) {
+    // Uses the fast heuristic AI (not BayesianAI) as the internal evaluator
+    // -- BayesianAI is ~100x slower per game, which would make this search
+    // (dozens of simulated games) take minutes instead of ~1 second. A
+    // layout that resists ProbabilityAI well also resists BayesianAI well
+    // in practice, since both ultimately concentrate fire the same way
+    // once a hit is found.
     const board = makeEmptyBoard();
     const attacker = new ProbabilityAI(sizes);
-    let remaining = ships.size;
     let shots = 0;
-    const sunkReported = new Set();
-
-    while (remaining > 0 && shots < CELL_COUNT) {
+    let remaining = ships.size;
+    const maxShots = ROWS * COLS;
+    while (remaining > 0 && shots < maxShots) {
       const [r, c] = attacker.selectNextMove(board);
       shots++;
       const k = key(r, c);
       if (ships.has(k)) {
         board[r][c] = "hit";
         remaining--;
-        const ship = layout.find((candidate) =>
-          shipCells(candidate.r, candidate.c, candidate.length, candidate.orientation).some(
-            ([rr, cc]) => rr === r && cc === c
-          )
-        );
-        if (ship) {
-          const cells = shipCells(ship.r, ship.c, ship.length, ship.orientation);
-          const signature = normalizedCellSignature(cells);
-          if (!sunkReported.has(signature) && cells.every(([rr, cc]) => board[rr][cc] === "hit")) {
-            sunkReported.add(signature);
-            attacker.recordShotResult({ sunkLength: ship.length, sunkCells: cells });
-          }
-        }
       } else {
         board[r][c] = "miss";
       }
@@ -938,22 +1358,28 @@ class PlacementAI {
 
   shipCellSet(layout) {
     const cells = new Set();
-    for (const ship of layout) {
-      const placed = ship.cells || shipCells(ship.r, ship.c, ship.length, ship.orientation);
-      for (const [r, c] of placed) cells.add(key(r, c));
+    for (const { r, c, length, orientation } of layout) {
+      for (const [rr, cc] of shipCells(r, c, length, orientation)) cells.add(key(rr, cc));
     }
     return cells;
   }
 
-  randomLegalLayout(sizes, maxAttempts = 800) {
+  randomLegalLayout(sizes, maxAttempts = 500) {
     const occupied = new Set();
     const layout = [];
-    for (const length of [...sizes].sort((a, b) => b - a)) {
+    const sorted = [...sizes].sort((a, b) => b - a);
+    for (const length of sorted) {
       let placed = false;
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         const orientation = Math.random() < 0.5 ? "H" : "V";
-        const r = orientation === "H" ? randInt(ROWS) : randInt(ROWS - length + 1);
-        const c = orientation === "H" ? randInt(COLS - length + 1) : randInt(COLS);
+        let r, c;
+        if (orientation === "H") {
+          r = randInt(ROWS);
+          c = randInt(COLS - length + 1);
+        } else {
+          r = randInt(ROWS - length + 1);
+          c = randInt(COLS);
+        }
         const cells = shipCells(r, c, length, orientation);
         if (cells.some(([rr, cc]) => occupied.has(key(rr, cc)))) continue;
         layout.push({ r, c, length, orientation });
@@ -964,21 +1390,5 @@ class PlacementAI {
       if (!placed) return null;
     }
     return layout;
-  }
-
-  static isLegalLayout(layout) {
-    if (!Array.isArray(layout) || layout.length !== STANDARD_FLEET.length) return false;
-    const occupied = new Set();
-    for (const ship of layout) {
-      if (!["H", "V"].includes(ship.orientation)) return false;
-      const cells = shipCells(ship.r, ship.c, ship.length, ship.orientation);
-      for (const [r, c] of cells) {
-        if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return false;
-        const k = key(r, c);
-        if (occupied.has(k)) return false;
-        occupied.add(k);
-      }
-    }
-    return true;
   }
 }
