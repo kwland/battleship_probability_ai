@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Battleship Probability AI</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <h1>Battleship Probability AI</h1>
+  <p class="subtitle">
+    A probability-density hunt/target AI for an 8&times;11 board. Play against it,
+    watch its live "heatmap" of likely ship cells, and benchmark it against a
+    random-shot baseline.
+  </p>
+</header>
+
+<main>
+  <section class="controls">
+    <button id="new-game">New Game</button>
+    <label>
+      Opponent:
+      <select id="difficulty">
+        <option value="probability" selected>Probability AI (smart)</option>
+        <option value="random">Random AI (baseline)</option>
+      </select>
+    </label>
+    <label class="checkbox-label">
+      <input type="checkbox" id="heatmap-toggle" checked />
+      Show AI heatmap on your board
+    </label>
+  </section>
+
+  <p id="status" class="status">Your move — fire on the enemy waters.</p>
+
+  <section class="boards">
+    <div class="board-panel">
+      <h2>Your Fleet <span class="hint">(AI fires here)</span></h2>
+      <div id="player-board" class="board"></div>
+      <p class="stat-line">Shots taken by AI: <strong id="shots-ai">0</strong> &middot; Ships afloat: <strong id="ships-player">5</strong></p>
+    </div>
+
+    <div class="board-panel">
+      <h2>Enemy Fleet <span class="hint">(click to fire)</span></h2>
+      <div id="enemy-board" class="board"></div>
+      <p class="stat-line">Shots taken by you: <strong id="shots-player">0</strong> &middot; Ships afloat: <strong id="ships-enemy">5</strong></p>
+    </div>
+  </section>
+
+  <section class="legend">
+    <span><i class="swatch unknown"></i> Unknown</span>
+    <span><i class="swatch ship"></i> Your ship</span>
+    <span><i class="swatch hit"></i> Hit</span>
+    <span><i class="swatch miss"></i> Miss</span>
+    <span><i class="swatch heat"></i> AI's target likelihood</span>
+  </section>
+
+  <section class="benchmark">
+    <h2>Benchmark: Probability AI vs Random AI</h2>
+    <p>
+      Runs both AIs against freshly-randomized fleets and reports the average
+      number of shots each needs to sink a full fleet on this board (fewer is
+      better).
+    </p>
+    <div class="bench-controls">
+      <label>
+        Games per AI:
+        <input type="number" id="bench-n" value="200" min="10" max="1000" />
+      </label>
+      <button id="bench-run">Run benchmark</button>
+    </div>
+    <div id="bench-output" class="bench-output"></div>
+  </section>
+
+  <section class="about">
+    <h2>How it works</h2>
+    <p>
+      For every remaining ship length, the AI enumerates every horizontal and
+      vertical placement still consistent with the board (no placement may
+      cross a confirmed miss or a cell already resolved as part of a sunk
+      ship) and tallies, per cell, how many valid placements cover it. Cells
+      covered by more possible placements are more likely to actually hold a
+      ship, so the AI fires at the highest-density unknown cell. Once a hit
+      is still unresolved, the AI narrows to placements that cover that hit
+      ("target mode"), which naturally finishes off a found ship before
+      hunting a new one &mdash; without any hardcoded direction logic.
+    </p>
+    <p>
+      Ship placement uses a similar trick in reverse: it plays a few
+      simulated games against the Probability AI for several random legal
+      layouts and keeps whichever one survives the longest on average.
+    </p>
+  </section>
+</main>
+
+<footer>
+  <p>Static, client-side JS &mdash; no backend. See <code>ai.js</code> for the AI implementation.</p>
+</footer>
+
+<script src="ai.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
