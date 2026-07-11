@@ -4,7 +4,10 @@
 // composition, which the player attacks) and for the "Auto-Place (Smart)"
 // button. Higher than the class default since this only runs once per game
 // and the board is small, so we can afford a more thorough search.
-const STRONG_PLACEMENT = { restarts: 25, gamesPerCandidate: 5 };
+const STRONG_PLACEMENT = { restarts: 50, gamesPerCandidate: 7 };
+const LEARNING_STORAGE_KEY = "battleship-ultimate-learning-v1";
+const MAX_LEARNED_GAMES = 40;
+let optimizedLayoutsReady = null;
 
 const ICON_HIT = `<svg class="icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
   <circle cx="12" cy="12" r="9" style="fill:var(--hit-glow);opacity:0.35"/>
@@ -37,6 +40,8 @@ const state = {
   shotsPlayer: 0,
   shotsAI: 0,
   heatmapOn: true,
+  playerShotOrder: [],
+  learningSaved: false,
 };
 
 let setupCellEls = []; // [r][c] -> DOM element, built once per setup session
@@ -220,7 +225,12 @@ function rotateSelected() {
 
 function smartAutoPlace() {
   const sizes = STANDARD_FLEET_SIZES;
-  const layout = new PlacementAI(STRONG_PLACEMENT).placeShips(sizes);
+  const learned = loadLearningData();
+  const layout = new PlacementAI({
+    ...STRONG_PLACEMENT,
+    shotHistory: learned.playerShotOrders,
+    usedLayouts: learned.enemyLayouts,
+  }).placeShips(sizes);
   // STANDARD_FLEET is already sorted largest-to-smallest, matching the
   // descending sort PlacementAI uses internally, so indices line up 1:1.
   state.setup.placed = layout.map((s) => ({ ...s, cells: shipCells(s.r, s.c, s.length, s.orientation) }));
@@ -254,13 +264,69 @@ function shipsAfloat(layout, boardState) {
   return layout.filter((ship) => !isShipSunk(ship, boardState)).length;
 }
 
-function startBattle() {
-  const sizes = STANDARD_FLEET_SIZES;
+function emptyLearningData() {
+  return { playerLayouts: [], playerShotOrders: [], enemyLayouts: [] };
+}
 
+function loadLearningData() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LEARNING_STORAGE_KEY) || "null");
+    if (!parsed || typeof parsed !== "object") return emptyLearningData();
+    return {
+      playerLayouts: Array.isArray(parsed.playerLayouts) ? parsed.playerLayouts.slice(-MAX_LEARNED_GAMES) : [],
+      playerShotOrders: Array.isArray(parsed.playerShotOrders) ? parsed.playerShotOrders.slice(-MAX_LEARNED_GAMES) : [],
+      enemyLayouts: Array.isArray(parsed.enemyLayouts) ? parsed.enemyLayouts.slice(-MAX_LEARNED_GAMES) : [],
+    };
+  } catch (error) {
+    return emptyLearningData();
+  }
+}
+
+function compactLayout(layout) {
+  return layout.map(({ r, c, length, orientation }) => ({ r, c, length, orientation }));
+}
+
+function saveGameLearning() {
+  if (state.learningSaved || !state.winner) return;
+  const learned = loadLearningData();
+  learned.playerLayouts.push(compactLayout(state.playerLayout));
+  learned.playerShotOrders.push(state.playerShotOrder.map(([r, c]) => [r, c]));
+  learned.enemyLayouts.push(compactLayout(state.enemyLayout));
+  learned.playerLayouts = learned.playerLayouts.slice(-MAX_LEARNED_GAMES);
+  learned.playerShotOrders = learned.playerShotOrders.slice(-MAX_LEARNED_GAMES);
+  learned.enemyLayouts = learned.enemyLayouts.slice(-MAX_LEARNED_GAMES);
+  try {
+    localStorage.setItem(LEARNING_STORAGE_KEY, JSON.stringify(learned));
+  } catch (error) {
+    // The game still works if storage is unavailable.
+  }
+  state.learningSaved = true;
+}
+
+function resetAIMemory() {
+  try {
+    localStorage.removeItem(LEARNING_STORAGE_KEY);
+  } catch (error) {
+    // Ignore storage failures.
+  }
+  setStatus("AI memory cleared.");
+}
+
+async function startBattle() {
+  const sizes = STANDARD_FLEET_SIZES;
+  const startButton = document.getElementById("start-battle");
+  startButton.disabled = true;
+  if (optimizedLayoutsReady) await optimizedLayoutsReady;
+
+  const learned = loadLearningData();
   state.playerLayout = state.setup.placed.map((s) => ({ ...s }));
   state.playerShips = shipSetOf(state.playerLayout);
 
-  const enemyRaw = new PlacementAI(STRONG_PLACEMENT).placeShips(sizes);
+  const enemyRaw = new PlacementAI({
+    ...STRONG_PLACEMENT,
+    shotHistory: learned.playerShotOrders,
+    usedLayouts: learned.enemyLayouts,
+  }).placeShips(sizes);
   state.enemyLayout = withCells(enemyRaw);
   state.enemyShips = shipSetOf(state.enemyLayout);
 
@@ -273,20 +339,30 @@ function startBattle() {
   } else if (difficulty === "probability") {
     state.attackerAI = new ProbabilityAI(sizes);
   } else {
-    state.attackerAI = new BayesianAI(sizes);
+    state.attackerAI = new BayesianAI(sizes, { historicalLayouts: learned.playerLayouts });
   }
 
-  state.turn = "player";
+  // A coin flip removes the permanent first-move advantage the old version
+  // gave the human in every game.
+  state.turn = Math.random() < 0.5 ? "player" : "ai";
   state.winner = null;
   state.shotsPlayer = 0;
   state.shotsAI = 0;
+  state.playerShotOrder = [];
+  state.learningSaved = false;
 
   document.getElementById("setup-section").hidden = true;
   document.getElementById("battle-section").hidden = false;
   state.phase = "battle";
 
-  setStatus("Your move — fire on the enemy waters.");
-  render();
+  if (state.turn === "player") {
+    setStatus("You won the opening coin flip — fire first.");
+    render();
+  } else {
+    setStatus("The AI won the opening coin flip and fires first...");
+    render();
+    setTimeout(aiTurn, 500);
+  }
 }
 
 function resetToSetup() {
@@ -305,13 +381,15 @@ function onEnemyCellClick(r, c) {
   if (state.enemyBoardState[r][c] !== null) return;
 
   state.shotsPlayer++;
+  state.playerShotOrder.push([r, c]);
   const hit = state.enemyShips.has(key(r, c));
   state.enemyBoardState[r][c] = hit ? "hit" : "miss";
 
   if (shipsAfloat(state.enemyLayout, state.enemyBoardState) === 0) {
     state.winner = "player";
     state.turn = "over";
-    setStatus(`You sank the enemy fleet in ${state.shotsPlayer} shots!`);
+    setStatus(`You sank the enemy fleet in ${state.shotsPlayer} shots! The AI will learn from this game.`);
+    saveGameLearning();
     render();
     return;
   }
@@ -330,16 +408,38 @@ function aiTurn() {
   const hit = state.playerShips.has(key(r, c));
   state.playerBoardState[r][c] = hit ? "hit" : "miss";
 
+  let sunkShip = null;
+  if (hit) {
+    const struckShip = state.playerLayout.find((ship) => ship.cells.some(([rr, cc]) => rr === r && cc === c));
+    if (struckShip && isShipSunk(struckShip, state.playerBoardState)) sunkShip = struckShip;
+  }
+
+  if (typeof state.attackerAI.recordShotResult === "function") {
+    state.attackerAI.recordShotResult({
+      row: r,
+      col: c,
+      hit,
+      sunkLength: sunkShip ? sunkShip.length : null,
+      sunkCells: sunkShip ? sunkShip.cells : null,
+    });
+  }
+
   if (shipsAfloat(state.playerLayout, state.playerBoardState) === 0) {
     state.winner = "ai";
     state.turn = "over";
-    setStatus(`The AI sank your fleet in ${state.shotsAI} shots. Try again!`);
+    setStatus(`The AI sank your fleet in ${state.shotsAI} shots. Its memory updates after this game.`);
+    saveGameLearning();
     render();
     return;
   }
 
   state.turn = "player";
-  setStatus(hit ? "The AI hit one of your ships! Your move." : "The AI missed. Your move.");
+  if (sunkShip) {
+    const name = STANDARD_FLEET.find((ship) => ship.length === sunkShip.length)?.name || "ship";
+    setStatus(`The AI sank your ${name}! Your move.`);
+  } else {
+    setStatus(hit ? "The AI hit one of your ships! Your move." : "The AI missed. Your move.");
+  }
   render();
 }
 
@@ -467,9 +567,11 @@ function render() {
 
 /* ==================== Benchmark ==================== */
 
-function playGame(AIClass, ships, sizes) {
+function playGame(AIClass, layout, sizes) {
   const board = makeEmptyBoard();
+  const ships = shipSetOf(layout);
   const ai = new AIClass(sizes);
+  const reportedSunk = new Set();
   let shots = 0;
   let remaining = ships.size;
   const maxShots = ROWS * COLS;
@@ -477,11 +579,29 @@ function playGame(AIClass, ships, sizes) {
     const [r, c] = ai.selectNextMove(board);
     shots++;
     const k = key(r, c);
+    let sunkShip = null;
     if (ships.has(k)) {
       board[r][c] = "hit";
       remaining--;
+      const struck = layout.find((ship) => ship.cells.some(([rr, cc]) => rr === r && cc === c));
+      if (struck && isShipSunk(struck, board)) {
+        const signature = struck.cells.map(([rr, cc]) => key(rr, cc)).sort().join("|");
+        if (!reportedSunk.has(signature)) {
+          reportedSunk.add(signature);
+          sunkShip = struck;
+        }
+      }
     } else {
       board[r][c] = "miss";
+    }
+    if (typeof ai.recordShotResult === "function") {
+      ai.recordShotResult({
+        row: r,
+        col: c,
+        hit: ships.has(k),
+        sunkLength: sunkShip ? sunkShip.length : null,
+        sunkCells: sunkShip ? sunkShip.cells : null,
+      });
     }
   }
   return shots;
@@ -501,7 +621,7 @@ async function runBenchmark() {
   // run far fewer games for it so the benchmark finishes in a reasonable
   // time, and run every AI in small async-yielding batches so the page
   // stays responsive and shows live progress instead of freezing.
-  const nBayes = Math.max(5, Math.min(30, Math.round(n / 30)));
+  const nBayes = Math.max(3, Math.min(15, Math.round(n / 50)));
 
   button.disabled = true;
 
@@ -511,9 +631,8 @@ async function runBenchmark() {
   async function runSet(AIClass, games, label) {
     let total = 0;
     for (let i = 0; i < games; i++) {
-      const layout = placer.randomLegalLayout(sizes);
-      const ships = placer.shipCellSet(layout);
-      total += playGame(AIClass, ships, sizes);
+      const layout = withCells(placer.randomLegalLayout(sizes));
+      total += playGame(AIClass, layout, sizes);
       if (i % 5 === 4) {
         output.textContent = `Running ${label}: ${i + 1}/${games} games...`;
         await yieldToUI();
@@ -524,14 +643,14 @@ async function runBenchmark() {
 
   const avgRandom = await runSet(RandomAI, n, "RandomAI");
   const avgProb = await runSet(ProbabilityAI, n, "ProbabilityAI");
-  const avgBayes = await runSet(BayesianAI, nBayes, "BayesianAI (slower, fewer games)");
+  const avgBayes = await runSet(BayesianAI, nBayes, "Adaptive BayesianAI (slower, fewer games)");
 
   const improvement = ((avgRandom - avgBayes) / avgRandom) * 100;
 
   output.innerHTML =
     `<div>RandomAI: avg <strong>${avgRandom.toFixed(1)}</strong> shots to win (${n} games)</div>` +
     `<div>ProbabilityAI: avg <strong>${avgProb.toFixed(1)}</strong> shots to win (${n} games)</div>` +
-    `<div>BayesianAI: avg <strong>${avgBayes.toFixed(1)}</strong> shots to win (${nBayes} games)</div>` +
+    `<div>Adaptive BayesianAI: avg <strong>${avgBayes.toFixed(1)}</strong> shots to win (${nBayes} games)</div>` +
     `<div class="bench-highlight">BayesianAI wins with ${improvement.toFixed(1)}% fewer shots than random, and fewer than ProbabilityAI too.</div>`;
 
   button.disabled = false;
@@ -543,6 +662,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("rotate-ship").addEventListener("click", rotateSelected);
   document.getElementById("smart-place").addEventListener("click", smartAutoPlace);
   document.getElementById("clear-placement").addEventListener("click", clearPlacement);
+  document.getElementById("reset-ai-memory").addEventListener("click", resetAIMemory);
   document.getElementById("start-battle").addEventListener("click", startBattle);
 
   document.getElementById("new-game").addEventListener("click", resetToSetup);
@@ -560,10 +680,9 @@ document.addEventListener("DOMContentLoaded", () => {
     if (e.key === "r" || e.key === "R") rotateSelected();
   });
 
-  // Load the offline-optimized diverse placement pool in the background. If
-  // it arrives before the first battle, the enemy fleet and "Auto-Place
-  // (Smart)" draw from it; otherwise PlacementAI falls back to a live search.
-  loadOptimizedLayouts();
+  // Keep the promise and await it before the first battle so the optimized
+  // placement pool is actually used rather than losing a race to fetch().
+  optimizedLayoutsReady = loadOptimizedLayouts();
 
   initSetup();
 });

@@ -3,16 +3,14 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Battleship Probability AI</title>
+<title>Battleship Ultimate AI</title>
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
 <header>
-  <h1>Battleship Probability AI</h1>
+  <h1>Battleship Ultimate AI</h1>
   <p class="subtitle">
-    A probability-density hunt/target AI for an 8&times;11 board. Place your
-    fleet, play against the AI, watch its live "heatmap" of likely ship
-    cells, and benchmark it against a random-shot baseline.
+    An adaptive full-fleet Bayesian AI for an 8&times;11 board. It uses exact sunk-ship feedback, complete-fleet sampling, shallow lookahead, and memory of your previous games. A coin flip decides who fires first.
   </p>
 </header>
 
@@ -41,6 +39,7 @@
           <button id="rotate-ship" type="button">⟳ Rotate</button>
           <button id="smart-place" type="button">Auto-Place (Smart)</button>
           <button id="clear-placement" type="button">Clear All</button>
+          <button id="reset-ai-memory" type="button" class="secondary">Reset AI Memory</button>
         </div>
         <button id="start-battle" type="button" class="primary" disabled>Start Battle</button>
       </div>
@@ -54,7 +53,7 @@
       <label>
         Opponent:
         <select id="difficulty">
-          <option value="bayesian" selected>Bayesian AI (strongest)</option>
+          <option value="bayesian" selected>Adaptive Bayesian AI (strongest)</option>
           <option value="probability">Probability AI (heuristic)</option>
           <option value="random">Random AI (baseline)</option>
         </select>
@@ -98,7 +97,7 @@
   </section>
 
   <section class="benchmark">
-    <h2>Benchmark: Probability AI vs Random AI</h2>
+    <h2>Benchmark: Adaptive Bayesian AI vs Baselines</h2>
     <p>
       Runs both AIs against freshly-randomized fleets and reports the average
       number of shots each needs to sink a full fleet on this board (fewer is
@@ -117,52 +116,16 @@
   <section class="about">
     <h2>How it works</h2>
     <p>
-      <strong>Bayesian AI (default, strongest).</strong> Maintains a
-      persistent population of thousands of "particles" &mdash; complete,
-      internally consistent guesses at the whole fleet's layout &mdash;
-      across the entire game, filtering (not rebuilding) it after every
-      shot. A particle survives a miss only if none of its ships are there,
-      and survives a hit only if one of its ships is. Cells are scored from
-      what fraction of surviving particles agree on them, split into two
-      questions: <em>is anything here at all</em> (occupancy), and
-      <em>does a ship we've already found but not finished continue into
-      here</em> (active-ship / sink probability). Once any hits are on the
-      board, the second question dominates the score, so it finishes ships
-      it's found before hunting new ones. Retaining each particle's
-      individual ship identities &mdash; instead of collapsing a particle
-      into a single "occupied cells" set &mdash; is what lets it reason
-      correctly when two ships happen to be placed touching each other: it
-      never has to decide which specific ship a run of hits belongs to,
-      since every consistent interpretation stays alive in the population
-      until later shots naturally rule the wrong ones out.
+      <strong>Adaptive Bayesian AI (default, strongest).</strong> It maintains thousands of complete legal fleet hypotheses and filters them after every shot. Unlike the earlier version, the game reports the exact cells and length whenever a ship sinks, so the AI removes that ship without guessing. The surviving hypotheses are rejuvenated with constrained Gibbs moves, and shots are ranked using occupancy, partially-hit-ship continuation, sink probability, and a shallow two-shot lookahead.
     </p>
     <p>
-      <strong>Probability AI (heuristic).</strong> A much faster
-      approximation: for every ship length in the fleet, it enumerates
-      every placement still consistent with the board and tallies how many
-      valid placements cover each cell, independently per ship length. A
-      placement only counts toward "finishing a found ship" if it still has
-      an unknown cell to give (not if it's already fully revealed) &mdash;
-      good enough to avoid wasting shots on a fully-explained run, but
-      unlike the Bayesian AI it scores each ship length in isolation, so it
-      can't fully rule out an option that looks locally plausible but is
-      actually impossible once the rest of the board is taken into account.
+      <strong>Learning across games.</strong> Completed games are stored only in this browser. The attacker uses previous player layouts as an empirical prior, while the placement system learns which cells the player tends to fire at early. The memory is capped at 40 games and can be erased with <em>Reset AI Memory</em>. No data leaves the browser.
     </p>
     <p>
-      <strong>Ship placement.</strong> The enemy fleet (and the "Auto-Place
-      (Smart)" button) draws from a pool of layouts optimized offline by an
-      evolutionary search: it evolves candidate layouts over many
-      generations &mdash; mutating by moving, rotating, shifting, swapping,
-      or clustering ships &mdash; scoring each by how many shots a panel of
-      attackers needs to sink it, and rewards both average and
-      worst-case survival. From the result it keeps ~50 strong but
-      structurally <em>different</em> layouts and picks one at random each
-      game &mdash; a mixed strategy, so a repeat opponent can't learn a
-      single fixed pattern. (If that pre-computed pool isn't available, it
-      falls back to a quick live search that keeps the best of a handful of
-      random layouts.) The screening uses the fast Probability AI, not the
-      Bayesian AI, purely for speed &mdash; a layout that resists one
-      resists the other in practice.
+      <strong>Probability AI.</strong> A fast deterministic approximation that enumerates every legal placement for each remaining ship length. It now also receives exact sunk-ship information, making it a substantially stronger baseline.
+    </p>
+    <p>
+      <strong>Ship placement.</strong> The enemy chooses from a diverse pool of offline-optimized layouts. It then favors layouts that survived longest against the player's previous firing orders while keeping a randomized mixed strategy, so repeated games do not expose one fixed pattern.
     </p>
   </section>
 </main>
