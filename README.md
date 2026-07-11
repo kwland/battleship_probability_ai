@@ -1,9 +1,15 @@
 # Battleship Probability AI — Web Demo
 
 A static, client-side-only site (plain HTML/CSS/JS, no build step, no backend)
-that lets you play against the probability-density hunt/target AI from the
-Python version of this project, watch its live "heatmap" of likely ship
-cells, and benchmark it against a random-shot baseline.
+that lets you manually place your own fleet (or auto-place it with the same
+smart placement search used for the enemy fleet), play against the
+probability-density hunt/target AI from the Python version of this project,
+watch its live "heatmap" of likely ship cells, and benchmark it against a
+random-shot baseline.
+
+Ships render as rounded hulls with portholes, hits as a starburst with a
+red glow, misses as a ripple, and sunk ships flip to a grey "wreck" hull —
+no plain colored squares.
 
 ## Files
 

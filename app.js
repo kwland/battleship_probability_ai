@@ -1,10 +1,36 @@
 /* Game state + UI wiring for the interactive Battleship AI demo. */
 
+// Placement-search strength used for the enemy fleet (the AI's own fleet
+// composition, which the player attacks) and for the "Auto-Place (Smart)"
+// button. Higher than the class default since this only runs once per game
+// and the board is small, so we can afford a more thorough search.
+const STRONG_PLACEMENT = { restarts: 25, gamesPerCandidate: 5 };
+
+const ICON_HIT = `<svg class="icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+  <circle cx="12" cy="12" r="9" style="fill:var(--hit-glow);opacity:0.35"/>
+  <path d="M12 2 L14.2 9.2 L21 8 L15.8 13 L18.5 20 L12 15.8 L5.5 20 L8.2 13 L3 8 L9.8 9.2 Z" style="fill:var(--hit-core);stroke:var(--hit-glow);stroke-width:0.6;stroke-linejoin:round"/>
+</svg>`;
+
+const ICON_MISS = `<svg class="icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+  <circle cx="12" cy="12" r="2.6" style="fill:var(--miss-ring)"/>
+  <circle cx="12" cy="12" r="6.5" style="fill:none;stroke:var(--miss-ring);stroke-width:1.3;opacity:0.65"/>
+  <circle cx="12" cy="12" r="10" style="fill:none;stroke:var(--miss-ring);stroke-width:1;opacity:0.35"/>
+</svg>`;
+
 const state = {
-  playerShips: null, // Set<"r,c"> -- your fleet, attacked by the AI
-  enemyShips: null, // Set<"r,c"> -- enemy fleet, attacked by you
-  playerBoardState: null, // grid the AI has fired at (your fleet's perspective)
-  enemyBoardState: null, // grid you have fired at (enemy fleet's perspective)
+  phase: "setup", // "setup" | "battle"
+  setup: {
+    placed: [null, null, null, null, null], // index-aligned with STANDARD_FLEET
+    selected: 0,
+    orientation: "H",
+    hover: null, // [r, c]
+  },
+  playerLayout: [], // [{ r, c, length, orientation, cells: [[r,c], ...] }]
+  enemyLayout: [],
+  playerShips: null, // Set<"r,c">
+  enemyShips: null,
+  playerBoardState: null,
+  enemyBoardState: null,
   attackerAI: null,
   turn: "player", // "player" | "ai" | "over"
   winner: null,
@@ -13,28 +39,231 @@ const state = {
   heatmapOn: true,
 };
 
-function cellSetToBoard(cellSet, board) {
-  // used only for rendering "your fleet" ship silhouettes
-  return board;
-}
+let setupCellEls = []; // [r][c] -> DOM element, built once per setup session
 
-function allSunk(shipSet, boardState) {
-  for (const k of shipSet) {
-    const [r, c] = k.split(",").map(Number);
-    if (boardState[r][c] !== "hit") return false;
+/* ==================== Setup / placement phase ==================== */
+
+function setupOccupiedSet() {
+  const occupied = new Set();
+  for (const ship of state.setup.placed) {
+    if (!ship) continue;
+    for (const [r, c] of ship.cells) occupied.add(key(r, c));
   }
-  return true;
+  return occupied;
 }
 
-function newGame() {
+function inBounds(cells) {
+  return cells.every(([r, c]) => r >= 0 && r < ROWS && c >= 0 && c < COLS);
+}
+
+function initSetup() {
+  state.setup = { placed: [null, null, null, null, null], selected: 0, orientation: "H", hover: null };
+  buildSetupBoardCells();
+  renderSetupAll();
+}
+
+function buildSetupBoardCells() {
+  const container = document.getElementById("setup-board");
+  container.innerHTML = "";
+  container.style.setProperty("--cols", COLS);
+  container.style.setProperty("--rows", ROWS);
+  setupCellEls = [];
+
+  for (let r = 0; r < ROWS; r++) {
+    const row = [];
+    for (let c = 0; c < COLS; c++) {
+      const cell = document.createElement("div");
+      cell.className = "cell clickable";
+      cell.addEventListener("click", () => onSetupCellClick(r, c));
+      cell.addEventListener("mouseenter", () => {
+        state.setup.hover = [r, c];
+        renderSetupShipLayer();
+      });
+      cell.addEventListener("mouseleave", () => {
+        if (state.setup.hover && state.setup.hover[0] === r && state.setup.hover[1] === c) {
+          state.setup.hover = null;
+          renderSetupShipLayer();
+        }
+      });
+      container.appendChild(cell);
+      row.push(cell);
+    }
+    setupCellEls.push(row);
+  }
+}
+
+function onSetupCellClick(r, c) {
+  const pickIdx = state.setup.placed.findIndex((s) => s && s.cells.some(([rr, cc]) => rr === r && cc === c));
+  if (pickIdx !== -1) {
+    state.setup.placed[pickIdx] = null;
+    state.setup.selected = pickIdx;
+    renderSetupAll();
+    return;
+  }
+
+  const sel = state.setup.selected;
+  if (sel === null || sel === undefined || state.setup.placed[sel]) return;
+
+  const length = STANDARD_FLEET[sel].length;
+  const cells = shipCells(r, c, length, state.setup.orientation);
+  if (!inBounds(cells)) return;
+  const occupied = setupOccupiedSet();
+  if (cells.some(([rr, cc]) => occupied.has(key(rr, cc)))) return;
+
+  state.setup.placed[sel] = { r, c, length, orientation: state.setup.orientation, cells };
+
+  let next = null;
+  for (let i = 0; i < STANDARD_FLEET.length; i++) {
+    const idx = (sel + 1 + i) % STANDARD_FLEET.length;
+    if (!state.setup.placed[idx]) {
+      next = idx;
+      break;
+    }
+  }
+  state.setup.selected = next;
+  renderSetupAll();
+}
+
+function renderSetupAll() {
+  renderFleetList();
+  renderSetupShipLayer();
+  updateSetupCellTransparency();
+  document.getElementById("start-battle").disabled = !state.setup.placed.every(Boolean);
+}
+
+function updateSetupCellTransparency() {
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) setupCellEls[r][c].classList.remove("transparent");
+  }
+  const occupied = setupOccupiedSet();
+  for (const k of occupied) {
+    const [r, c] = k.split(",").map(Number);
+    setupCellEls[r][c].classList.add("transparent");
+  }
+}
+
+function renderFleetList() {
+  const list = document.getElementById("fleet-list");
+  list.innerHTML = "";
+  STANDARD_FLEET.forEach((ship, i) => {
+    const li = document.createElement("li");
+    li.className = "fleet-item" + (state.setup.selected === i ? " selected" : "") + (state.setup.placed[i] ? " placed" : "");
+
+    const swatch = document.createElement("div");
+    swatch.className = "fleet-swatch";
+    for (let k = 0; k < ship.length; k++) swatch.appendChild(document.createElement("i"));
+
+    const name = document.createElement("span");
+    name.className = "fleet-name";
+    name.textContent = `${ship.name} (${ship.length})`;
+
+    const status = document.createElement("span");
+    status.className = "hint";
+    status.textContent = state.setup.placed[i] ? "placed" : "";
+
+    li.appendChild(swatch);
+    li.appendChild(name);
+    li.appendChild(status);
+
+    li.addEventListener("click", () => {
+      if (state.setup.placed[i]) {
+        state.setup.placed[i] = null;
+      }
+      state.setup.selected = i;
+      renderSetupAll();
+    });
+
+    list.appendChild(li);
+  });
+}
+
+function renderSetupShipLayer() {
+  const layer = document.getElementById("setup-ship-layer");
+  layer.innerHTML = "";
+  layer.style.setProperty("--cols", COLS);
+  layer.style.setProperty("--rows", ROWS);
+
+  for (const ship of state.setup.placed) {
+    if (ship) layer.appendChild(buildHullElement(ship, false));
+  }
+
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) setupCellEls[r][c].classList.remove("hover-invalid");
+  }
+
+  const sel = state.setup.selected;
+  const hover = state.setup.hover;
+  if (sel === null || sel === undefined || state.setup.placed[sel] || !hover) return;
+
+  const [hr, hc] = hover;
+  const length = STANDARD_FLEET[sel].length;
+  const cells = shipCells(hr, hc, length, state.setup.orientation);
+
+  if (!inBounds(cells)) {
+    setupCellEls[hr][hc].classList.add("hover-invalid");
+    return;
+  }
+
+  const occupied = setupOccupiedSet();
+  const legal = !cells.some(([rr, cc]) => occupied.has(key(rr, cc)));
+  const previewShip = { r: hr, c: hc, length, orientation: state.setup.orientation, cells };
+  const hull = buildHullElement(previewShip, false);
+  hull.classList.add("preview");
+  if (!legal) hull.classList.add("invalid");
+  layer.appendChild(hull);
+}
+
+function rotateSelected() {
+  state.setup.orientation = state.setup.orientation === "H" ? "V" : "H";
+  renderSetupShipLayer();
+}
+
+function smartAutoPlace() {
+  const sizes = STANDARD_FLEET_SIZES;
+  const layout = new PlacementAI(STRONG_PLACEMENT).placeShips(sizes);
+  // STANDARD_FLEET is already sorted largest-to-smallest, matching the
+  // descending sort PlacementAI uses internally, so indices line up 1:1.
+  state.setup.placed = layout.map((s) => ({ ...s, cells: shipCells(s.r, s.c, s.length, s.orientation) }));
+  state.setup.selected = null;
+  renderSetupAll();
+}
+
+function clearPlacement() {
+  state.setup.placed = [null, null, null, null, null];
+  state.setup.selected = 0;
+  renderSetupAll();
+}
+
+/* ==================== Battle phase ==================== */
+
+function withCells(layoutArr) {
+  return layoutArr.map((s) => ({ ...s, cells: shipCells(s.r, s.c, s.length, s.orientation) }));
+}
+
+function shipSetOf(layout) {
+  const set = new Set();
+  for (const ship of layout) for (const [r, c] of ship.cells) set.add(key(r, c));
+  return set;
+}
+
+function isShipSunk(ship, boardState) {
+  return ship.cells.every(([r, c]) => boardState[r][c] === "hit");
+}
+
+function shipsAfloat(layout, boardState) {
+  return layout.filter((ship) => !isShipSunk(ship, boardState)).length;
+}
+
+function startBattle() {
   const sizes = STANDARD_FLEET_SIZES;
 
-  const placer = new PlacementAI();
-  const playerLayout = placer.placeShips(sizes);
-  const enemyLayout = placer.placeShips(sizes);
+  state.playerLayout = state.setup.placed.map((s) => ({ ...s }));
+  state.playerShips = shipSetOf(state.playerLayout);
 
-  state.playerShips = placer.shipCellSet(playerLayout);
-  state.enemyShips = placer.shipCellSet(enemyLayout);
+  const enemyRaw = new PlacementAI(STRONG_PLACEMENT).placeShips(sizes);
+  state.enemyLayout = withCells(enemyRaw);
+  state.enemyShips = shipSetOf(state.enemyLayout);
+
   state.playerBoardState = makeEmptyBoard();
   state.enemyBoardState = makeEmptyBoard();
 
@@ -46,8 +275,19 @@ function newGame() {
   state.shotsPlayer = 0;
   state.shotsAI = 0;
 
+  document.getElementById("setup-section").hidden = true;
+  document.getElementById("battle-section").hidden = false;
+  state.phase = "battle";
+
   setStatus("Your move — fire on the enemy waters.");
   render();
+}
+
+function resetToSetup() {
+  state.phase = "setup";
+  document.getElementById("battle-section").hidden = true;
+  document.getElementById("setup-section").hidden = false;
+  initSetup();
 }
 
 function setStatus(msg) {
@@ -62,10 +302,10 @@ function onEnemyCellClick(r, c) {
   const hit = state.enemyShips.has(key(r, c));
   state.enemyBoardState[r][c] = hit ? "hit" : "miss";
 
-  if (allSunk(state.enemyShips, state.enemyBoardState)) {
+  if (shipsAfloat(state.enemyLayout, state.enemyBoardState) === 0) {
     state.winner = "player";
     state.turn = "over";
-    setStatus(`You sank the enemy fleet in ${state.shotsPlayer} shots! 🎉`);
+    setStatus(`You sank the enemy fleet in ${state.shotsPlayer} shots!`);
     render();
     return;
   }
@@ -84,7 +324,7 @@ function aiTurn() {
   const hit = state.playerShips.has(key(r, c));
   state.playerBoardState[r][c] = hit ? "hit" : "miss";
 
-  if (allSunk(state.playerShips, state.playerBoardState)) {
+  if (shipsAfloat(state.playerLayout, state.playerBoardState) === 0) {
     state.winner = "ai";
     state.turn = "over";
     setStatus(`The AI sank your fleet in ${state.shotsAI} shots. Try again!`);
@@ -97,50 +337,7 @@ function aiTurn() {
   render();
 }
 
-/* ---------------- Rendering ---------------- */
-
-function render() {
-  renderBoard({
-    containerId: "player-board",
-    boardState: state.playerBoardState,
-    shipSet: state.playerShips,
-    revealShips: true,
-    clickable: false,
-    heatmap:
-      state.heatmapOn && state.attackerAI instanceof ProbabilityAI && state.turn !== "over"
-        ? state.attackerAI.currentDensityMap(state.playerBoardState)
-        : null,
-  });
-
-  renderBoard({
-    containerId: "enemy-board",
-    boardState: state.enemyBoardState,
-    shipSet: state.enemyShips,
-    revealShips: false,
-    clickable: state.turn === "player" && !state.winner,
-    heatmap: null,
-    onClick: onEnemyCellClick,
-  });
-
-  document.getElementById("shots-player").textContent = state.shotsPlayer;
-  document.getElementById("shots-ai").textContent = state.shotsAI;
-  document.getElementById("ships-player").textContent = shipsRemaining(state.playerShips, state.playerBoardState);
-  document.getElementById("ships-enemy").textContent = shipsRemaining(state.enemyShips, state.enemyBoardState);
-}
-
-function shipsRemaining(shipSet, boardState) {
-  // Approximate "ships remaining" by counting how many of the 5 ships still
-  // have at least one un-hit cell -- good enough for a scoreboard display.
-  // We reconstruct ship groups from the fleet sizes actually placed.
-  let hitCells = 0;
-  for (const k of shipSet) {
-    const [r, c] = k.split(",").map(Number);
-    if (boardState[r][c] === "hit") hitCells++;
-  }
-  const totalCells = shipSet.size;
-  const fractionSunk = hitCells / totalCells;
-  return Math.max(0, Math.round((1 - fractionSunk) * STANDARD_FLEET.length));
-}
+/* ==================== Rendering (battle) ==================== */
 
 function maxDensityValue(densityMap) {
   let max = 0;
@@ -148,10 +345,39 @@ function maxDensityValue(densityMap) {
   return max;
 }
 
-function renderBoard({ containerId, boardState, shipSet, revealShips, clickable, heatmap, onClick }) {
+function buildHullElement(ship, sunk) {
+  const el = document.createElement("div");
+  el.className = "ship-hull" + (ship.orientation === "V" ? " vertical" : "") + (sunk ? " wreck" : "");
+  if (ship.orientation === "H") {
+    el.style.gridRow = `${ship.r + 1}`;
+    el.style.gridColumn = `${ship.c + 1} / span ${ship.length}`;
+  } else {
+    el.style.gridRow = `${ship.r + 1} / span ${ship.length}`;
+    el.style.gridColumn = `${ship.c + 1}`;
+  }
+  for (let i = 0; i < ship.length; i++) {
+    el.appendChild(document.createElement("span")).className = "porthole";
+  }
+  return el;
+}
+
+function renderShipLayer(layerId, layout, boardState, revealAll) {
+  const layer = document.getElementById(layerId);
+  layer.innerHTML = "";
+  layer.style.setProperty("--cols", COLS);
+  layer.style.setProperty("--rows", ROWS);
+  for (const ship of layout) {
+    const sunk = isShipSunk(ship, boardState);
+    if (!revealAll && !sunk) continue;
+    layer.appendChild(buildHullElement(ship, sunk));
+  }
+}
+
+function renderBoard({ containerId, shipLayerId, boardState, shipSet, layout, own, clickable, heatmap, onClick }) {
   const container = document.getElementById(containerId);
   container.innerHTML = "";
   container.style.setProperty("--cols", COLS);
+  container.style.setProperty("--rows", ROWS);
 
   const maxDensity = heatmap ? maxDensityValue(heatmap) : 0;
 
@@ -159,15 +385,22 @@ function renderBoard({ containerId, boardState, shipSet, revealShips, clickable,
     for (let c = 0; c < COLS; c++) {
       const cell = document.createElement("div");
       cell.className = "cell";
-      const state_ = boardState[r][c];
+      const cellState = boardState[r][c];
       const isShip = shipSet.has(key(r, c));
 
-      if (state_ === "hit") {
-        cell.classList.add(isShip ? "hit" : "hit"); // hit is always a ship cell by construction
-      } else if (state_ === "miss") {
+      if (cellState === "hit") {
+        const sunk = layout.some((ship) => isShipSunk(ship, boardState) && ship.cells.some(([rr, cc]) => rr === r && cc === c));
+        if (sunk) {
+          cell.classList.add("sunk");
+        } else {
+          cell.classList.add("hit");
+          cell.innerHTML = ICON_HIT;
+        }
+      } else if (cellState === "miss") {
         cell.classList.add("miss");
+        cell.innerHTML = ICON_MISS;
       } else {
-        if (revealShips && isShip) cell.classList.add("ship");
+        if (own && isShip) cell.classList.add("transparent");
         if (heatmap && maxDensity > 0) {
           const v = heatmap.get(key(r, c));
           const intensity = v / maxDensity;
@@ -178,7 +411,7 @@ function renderBoard({ containerId, boardState, shipSet, revealShips, clickable,
         }
       }
 
-      if (clickable && state_ === null) {
+      if (clickable && cellState === null) {
         cell.classList.add("clickable");
         cell.addEventListener("click", () => onClick(r, c));
       }
@@ -186,9 +419,47 @@ function renderBoard({ containerId, boardState, shipSet, revealShips, clickable,
       container.appendChild(cell);
     }
   }
+
+  renderShipLayer(shipLayerId, layout, boardState, own);
 }
 
-/* ---------------- Benchmark ---------------- */
+function render() {
+  const heatmap =
+    state.heatmapOn && state.attackerAI instanceof ProbabilityAI && state.turn !== "over"
+      ? state.attackerAI.currentDensityMap(state.playerBoardState)
+      : null;
+
+  renderBoard({
+    containerId: "player-board",
+    shipLayerId: "player-ship-layer",
+    boardState: state.playerBoardState,
+    shipSet: state.playerShips,
+    layout: state.playerLayout,
+    own: true,
+    clickable: false,
+    heatmap,
+    onClick: null,
+  });
+
+  renderBoard({
+    containerId: "enemy-board",
+    shipLayerId: "enemy-ship-layer",
+    boardState: state.enemyBoardState,
+    shipSet: state.enemyShips,
+    layout: state.enemyLayout,
+    own: false,
+    clickable: state.turn === "player" && !state.winner,
+    heatmap: null,
+    onClick: onEnemyCellClick,
+  });
+
+  document.getElementById("shots-player").textContent = state.shotsPlayer;
+  document.getElementById("shots-ai").textContent = state.shotsAI;
+  document.getElementById("ships-player").textContent = shipsAfloat(state.playerLayout, state.playerBoardState);
+  document.getElementById("ships-enemy").textContent = shipsAfloat(state.enemyLayout, state.enemyBoardState);
+}
+
+/* ==================== Benchmark ==================== */
 
 function runBenchmark() {
   const n = Math.max(10, Math.min(1000, parseInt(document.getElementById("bench-n").value, 10) || 200));
@@ -244,16 +515,28 @@ function runBenchmark() {
   }, 30);
 }
 
-/* ---------------- Wiring ---------------- */
+/* ==================== Wiring ==================== */
 
 document.addEventListener("DOMContentLoaded", () => {
-  document.getElementById("new-game").addEventListener("click", newGame);
-  document.getElementById("difficulty").addEventListener("change", newGame);
+  document.getElementById("rotate-ship").addEventListener("click", rotateSelected);
+  document.getElementById("smart-place").addEventListener("click", smartAutoPlace);
+  document.getElementById("clear-placement").addEventListener("click", clearPlacement);
+  document.getElementById("start-battle").addEventListener("click", startBattle);
+
+  document.getElementById("new-game").addEventListener("click", resetToSetup);
+  document.getElementById("difficulty").addEventListener("change", () => {
+    if (state.phase === "battle" && !state.winner) return; // don't swap mid-game
+  });
   document.getElementById("heatmap-toggle").addEventListener("change", (e) => {
     state.heatmapOn = e.target.checked;
-    render();
+    if (state.phase === "battle") render();
   });
   document.getElementById("bench-run").addEventListener("click", runBenchmark);
 
-  newGame();
+  window.addEventListener("keydown", (e) => {
+    if (state.phase !== "setup") return;
+    if (e.key === "r" || e.key === "R") rotateSelected();
+  });
+
+  initSetup();
 });

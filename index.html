@@ -10,50 +10,90 @@
 <header>
   <h1>Battleship Probability AI</h1>
   <p class="subtitle">
-    A probability-density hunt/target AI for an 8&times;11 board. Play against it,
-    watch its live "heatmap" of likely ship cells, and benchmark it against a
-    random-shot baseline.
+    A probability-density hunt/target AI for an 8&times;11 board. Place your
+    fleet, play against the AI, watch its live "heatmap" of likely ship
+    cells, and benchmark it against a random-shot baseline.
   </p>
 </header>
 
 <main>
-  <section class="controls">
-    <button id="new-game">New Game</button>
-    <label>
-      Opponent:
-      <select id="difficulty">
-        <option value="probability" selected>Probability AI (smart)</option>
-        <option value="random">Random AI (baseline)</option>
-      </select>
-    </label>
-    <label class="checkbox-label">
-      <input type="checkbox" id="heatmap-toggle" checked />
-      Show AI heatmap on your board
-    </label>
+
+  <!-- ============ SETUP PHASE ============ -->
+  <section id="setup-section" class="setup">
+    <h2>Place Your Fleet</h2>
+    <p class="setup-hint">
+      Pick a ship below, then click a cell on the board to place it. Click a
+      placed ship (in the list or on the board) to pick it back up. Press
+      <kbd>R</kbd> or the rotate button to change orientation.
+    </p>
+
+    <div class="setup-layout">
+      <div class="board-panel">
+        <div class="board-wrapper">
+          <div id="setup-board" class="board"></div>
+          <div id="setup-ship-layer" class="ship-layer"></div>
+        </div>
+      </div>
+
+      <div class="fleet-panel">
+        <ul id="fleet-list" class="fleet-list"></ul>
+        <div class="setup-actions">
+          <button id="rotate-ship" type="button">⟳ Rotate</button>
+          <button id="smart-place" type="button">Auto-Place (Smart)</button>
+          <button id="clear-placement" type="button">Clear All</button>
+        </div>
+        <button id="start-battle" type="button" class="primary" disabled>Start Battle</button>
+      </div>
+    </div>
   </section>
 
-  <p id="status" class="status">Your move — fire on the enemy waters.</p>
+  <!-- ============ BATTLE PHASE ============ -->
+  <section id="battle-section" class="battle" hidden>
+    <section class="controls">
+      <button id="new-game">New Game</button>
+      <label>
+        Opponent:
+        <select id="difficulty">
+          <option value="probability" selected>Probability AI (smart)</option>
+          <option value="random">Random AI (baseline)</option>
+        </select>
+      </label>
+      <label class="checkbox-label">
+        <input type="checkbox" id="heatmap-toggle" checked />
+        Show AI heatmap on your board
+      </label>
+    </section>
 
-  <section class="boards">
-    <div class="board-panel">
-      <h2>Your Fleet <span class="hint">(AI fires here)</span></h2>
-      <div id="player-board" class="board"></div>
-      <p class="stat-line">Shots taken by AI: <strong id="shots-ai">0</strong> &middot; Ships afloat: <strong id="ships-player">5</strong></p>
-    </div>
+    <p id="status" class="status">Your move — fire on the enemy waters.</p>
 
-    <div class="board-panel">
-      <h2>Enemy Fleet <span class="hint">(click to fire)</span></h2>
-      <div id="enemy-board" class="board"></div>
-      <p class="stat-line">Shots taken by you: <strong id="shots-player">0</strong> &middot; Ships afloat: <strong id="ships-enemy">5</strong></p>
-    </div>
-  </section>
+    <section class="boards">
+      <div class="board-panel">
+        <h2>Your Fleet <span class="hint">(AI fires here)</span></h2>
+        <div class="board-wrapper">
+          <div id="player-ship-layer" class="ship-layer"></div>
+          <div id="player-board" class="board"></div>
+        </div>
+        <p class="stat-line">Shots taken by AI: <strong id="shots-ai">0</strong> &middot; Ships afloat: <strong id="ships-player">5</strong></p>
+      </div>
 
-  <section class="legend">
-    <span><i class="swatch unknown"></i> Unknown</span>
-    <span><i class="swatch ship"></i> Your ship</span>
-    <span><i class="swatch hit"></i> Hit</span>
-    <span><i class="swatch miss"></i> Miss</span>
-    <span><i class="swatch heat"></i> AI's target likelihood</span>
+      <div class="board-panel">
+        <h2>Enemy Fleet <span class="hint">(click to fire)</span></h2>
+        <div class="board-wrapper">
+          <div id="enemy-ship-layer" class="ship-layer"></div>
+          <div id="enemy-board" class="board"></div>
+        </div>
+        <p class="stat-line">Shots taken by you: <strong id="shots-player">0</strong> &middot; Ships afloat: <strong id="ships-enemy">5</strong></p>
+      </div>
+    </section>
+
+    <section class="legend">
+      <span><i class="swatch unknown"></i> Unknown</span>
+      <span><i class="swatch ship"></i> Ship</span>
+      <span><i class="swatch hit"></i> Hit</span>
+      <span><i class="swatch sunk"></i> Sunk</span>
+      <span><i class="swatch miss"></i> Miss</span>
+      <span><i class="swatch heat"></i> AI's target likelihood</span>
+    </section>
   </section>
 
   <section class="benchmark">
@@ -87,9 +127,11 @@
       hunting a new one &mdash; without any hardcoded direction logic.
     </p>
     <p>
-      Ship placement uses a similar trick in reverse: it plays a few
-      simulated games against the Probability AI for several random legal
-      layouts and keeps whichever one survives the longest on average.
+      The enemy fleet you attack is placed by the same style of algorithm in
+      reverse: it plays many simulated games against the Probability AI for
+      a batch of random legal layouts and keeps whichever one survives the
+      longest on average &mdash; the "Auto-Place (Smart)" button uses the
+      same search for your own fleet.
     </p>
   </section>
 </main>
