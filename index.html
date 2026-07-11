@@ -117,24 +117,36 @@
   <section class="about">
     <h2>How it works</h2>
     <p>
-      <strong>Bayesian AI (default, strongest).</strong> Exactly enumerating
-      every way the whole remaining fleet could be arranged is
-      combinatorially infeasible, so each turn it draws thousands of random
-      <em>whole-fleet</em> configurations that are fully consistent with the
-      board so far &mdash; no two sampled ships overlap, none crosses a
-      confirmed miss, and every unresolved hit is covered by exactly one
-      sampled ship. Tallying which cells appear across those samples gives a
-      true joint probability estimate, so it correctly reasons about
-      multiple simultaneous hit clusters and ships blocking each other in a
-      way that scoring each ship length in isolation cannot.
+      <strong>Bayesian AI (default, strongest).</strong> Maintains a
+      persistent population of thousands of "particles" &mdash; complete,
+      internally consistent guesses at the whole fleet's layout &mdash;
+      across the entire game, filtering (not rebuilding) it after every
+      shot. A particle survives a miss only if none of its ships are there,
+      and survives a hit only if one of its ships is. Cells are scored from
+      what fraction of surviving particles agree on them, split into two
+      questions: <em>is anything here at all</em> (occupancy), and
+      <em>does a ship we've already found but not finished continue into
+      here</em> (active-ship / sink probability). Once any hits are on the
+      board, the second question dominates the score, so it finishes ships
+      it's found before hunting new ones. Retaining each particle's
+      individual ship identities &mdash; instead of collapsing a particle
+      into a single "occupied cells" set &mdash; is what lets it reason
+      correctly when two ships happen to be placed touching each other: it
+      never has to decide which specific ship a run of hits belongs to,
+      since every consistent interpretation stays alive in the population
+      until later shots naturally rule the wrong ones out.
     </p>
     <p>
-      <strong>Probability AI (heuristic).</strong> A faster, simpler
-      approximation: for every remaining ship length, it enumerates every
-      placement still consistent with the board and tallies how many valid
-      placements cover each cell, independently per ship length. Good, but
-      it can't jointly reason about several ships or hits at once the way
-      the Bayesian AI does.
+      <strong>Probability AI (heuristic).</strong> A much faster
+      approximation: for every ship length in the fleet, it enumerates
+      every placement still consistent with the board and tallies how many
+      valid placements cover each cell, independently per ship length. A
+      placement only counts toward "finishing a found ship" if it still has
+      an unknown cell to give (not if it's already fully revealed) &mdash;
+      good enough to avoid wasting shots on a fully-explained run, but
+      unlike the Bayesian AI it scores each ship length in isolation, so it
+      can't fully rule out an option that looks locally plausible but is
+      actually impossible once the rest of the board is taken into account.
     </p>
     <p>
       The enemy fleet you attack is placed by the same style of algorithm in

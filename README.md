@@ -11,18 +11,43 @@ no plain colored squares.
 
 ## AI opponents
 
-- **BayesianAI (default, strongest)** — Monte Carlo configuration-space
-  sampling. Each turn it draws thousands of complete, mutually consistent
-  whole-fleet layouts (no overlaps, nothing crossing a known miss, every
-  unresolved hit covered by some ship) and tallies true joint cell-occupancy
-  frequency across them. This is the closest practical stand-in for exact
-  Bayesian inference — exact enumeration of every possible fleet layout is
-  combinatorially infeasible even on this small board.
-- **ProbabilityAI (heuristic)** — scores each remaining ship length
-  independently (how many valid placements of that length cover each cell)
-  rather than jointly across the whole fleet. Faster, still strong, but
-  can't reason about multiple ships/hits interacting at once.
+- **BayesianAI (default, strongest)** — a persistent particle filter.
+  Maintains a population of thousands of "particles" (complete, internally
+  consistent whole-fleet layouts) across the entire game, filtering it
+  after every shot rather than rebuilding it from scratch: a particle
+  survives a miss only if none of its ships are there, and survives a hit
+  only if one of its ships is. Each particle keeps its ships' individual
+  identities rather than collapsing into one flat "occupied cells" set —
+  this is what lets it reason correctly when two ships are placed touching
+  each other, since it never has to *decide* which specific ship a run of
+  hits belongs to (see "Fixed bug" below). Scoring splits into an occupancy
+  probability (is anything here) and an active-ship / sink probability (does
+  a partially-hit ship continue into here), so once a hit exists it
+  concentrates fire on finishing that ship before hunting a new one. When
+  hunting, an entropy-style information-gain term nudges it toward cells
+  closer to 50/50, a cheap one-step-lookahead proxy for how much a shot
+  there would narrow down the remaining hypotheses.
+- **ProbabilityAI (heuristic)** — much faster and still strong: scores each
+  ship length independently (how many valid placements of that length cover
+  each cell) rather than jointly across the whole fleet, so it can't fully
+  rule out an option that looks locally plausible but is actually
+  impossible once the rest of the board is taken into account.
 - **RandomAI (baseline)** — fires at a uniformly random legal cell.
+
+### Fixed bug: sunk-ship detection breaking on touching ships
+
+An earlier version of both AIs tried to *infer* when a ship had sunk by
+looking for a run of hits capped on both ends by a miss or the board edge,
+then removed that ship's length from a "remaining sizes" list. This breaks
+when two ships are placed touching each other: their combined hit run looks
+exactly like one longer ship, so the AI could misidentify which ship sank,
+permanently corrupt its belief about the remaining fleet, and need nearly
+every cell on the board to finish the game. Neither AI does this anymore.
+`ProbabilityAI` never shrinks its ship-length list at all, and instead only
+targets placements that still have an unknown cell to give. `BayesianAI`
+goes further and never tries to *decide* anything about which ship is
+where — every consistent interpretation of a run of hits stays alive in the
+particle population until later shots naturally rule the wrong ones out.
 
 Ship placement (both the enemy fleet and the "Auto-Place (Smart)" button)
 searches random legal layouts and keeps whichever one survives longest
