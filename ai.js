@@ -1265,49 +1265,201 @@ class POMCPAI {
 
 /* ---------------- PlacementAI ---------------- */
 
-// Pool of pre-optimized, structurally-diverse layouts produced offline by
-// optimize_placement.py and shipped as layouts.json. Loaded once at startup
-// (see loadOptimizedLayouts). Each layout is an array of
-// {r, c, length, orientation}. Stays null if the file is missing/unreachable,
-// in which case PlacementAI falls back to a live game-based search.
-let OPTIMIZED_LAYOUTS = null;
+/*
+ * Strong placement is a MIXED strategy, not one fixed layout. layouts.json is
+ * produced by optimize_placement.js, which evolves legal fleets against an
+ * ensemble of attack policies and solves a finite maximin linear program for
+ * the sampling weights. The aggregate occupancy constraints stop the mixed
+ * strategy from developing obvious hot cells.
+ *
+ * At runtime the adversarial strategy can also use prior firing sequences from
+ * this browser. That adaptation never makes a layout deterministic: historical
+ * performance only tilts the maximin weights, and recent layouts are penalized
+ * so a repeat opponent cannot memorize one board.
+ */
+let OPTIMIZED_LAYOUTS = null; // [{id, weight, robustScore, layout:[ship,...]}]
+let OPTIMIZED_LAYOUT_META = null;
+
+function normalizeLoadedLayout(rawLayout) {
+  return rawLayout
+    .map((item) => {
+      if (Array.isArray(item)) {
+        const [r, c, length, orientation] = item;
+        return { r, c, length, orientation };
+      }
+      return { r: item.r, c: item.c, length: item.length, orientation: item.orientation };
+    })
+    .sort((a, b) => b.length - a.length || a.r - b.r || a.c - b.c);
+}
 
 async function loadOptimizedLayouts(url = "layouts.json") {
   try {
-    const resp = await fetch(url);
-    if (!resp.ok) return;
+    const resp = await fetch(url, { cache: "no-store" });
+    if (!resp.ok) return false;
     const data = await resp.json();
-    OPTIMIZED_LAYOUTS = (data.layouts || []).map((layout) =>
-      layout.map(([r, c, length, orientation]) => ({ r, c, length, orientation }))
-    );
+    const raw = data.layouts || [];
+    const entries = raw.map((item, i) => {
+      // Schema 2 stores metadata per layout. Schema 1 was a plain array and is
+      // still accepted so older layout pools remain usable.
+      const layoutRaw = Array.isArray(item) ? item : item.layout;
+      return {
+        id: item.id || `layout-${i + 1}`,
+        weight: Number.isFinite(item.weight) ? Math.max(0, item.weight) : 1,
+        robustScore: Number.isFinite(item.robust_score) ? item.robust_score : null,
+        expectedShots: Number.isFinite(item.expected_shots) ? item.expected_shots : null,
+        layout: normalizeLoadedLayout(layoutRaw),
+      };
+    }).filter((x) => x.layout.length > 0);
+    if (!entries.length) return false;
+    const total = entries.reduce((sum, x) => sum + x.weight, 0) || entries.length;
+    for (const entry of entries) entry.weight = (entry.weight || 1) / total;
+    OPTIMIZED_LAYOUTS = entries;
+    OPTIMIZED_LAYOUT_META = data;
+    return true;
   } catch (e) {
-    // No optimized pool available (e.g. opened via file:// where fetch is
-    // blocked, or the file was never generated). Live search will be used.
     OPTIMIZED_LAYOUTS = null;
+    OPTIMIZED_LAYOUT_META = null;
+    return false;
   }
 }
 
+function weightedEntryChoice(entries, weights) {
+  let total = 0;
+  for (const w of weights) total += Math.max(0, w);
+  if (!(total > 0)) return choice(entries);
+  let x = Math.random() * total;
+  for (let i = 0; i < entries.length; i++) {
+    x -= Math.max(0, weights[i]);
+    if (x <= 0) return entries[i];
+  }
+  return entries[entries.length - 1];
+}
+
 class PlacementAI {
-  constructor({ restarts = 10, gamesPerCandidate = 3 } = {}) {
+  constructor({
+    restarts = 10,
+    gamesPerCandidate = 3,
+    strategy = "adversarial",
+    shotHistory = [],
+    recentLayoutIds = [],
+    adaptationStrength = 1.35,
+  } = {}) {
     this.restarts = restarts;
     this.gamesPerCandidate = gamesPerCandidate;
+    this.strategy = strategy;
+    this.shotHistory = Array.isArray(shotHistory) ? shotHistory.slice(-30) : [];
+    this.recentLayoutIds = Array.isArray(recentLayoutIds) ? recentLayoutIds.slice(-12) : [];
+    this.adaptationStrength = adaptationStrength;
+    this.lastSelection = null;
+  }
+
+  static poolInfo() {
+    return OPTIMIZED_LAYOUTS
+      ? {
+          loaded: true,
+          count: OPTIMIZED_LAYOUTS.length,
+          method: OPTIMIZED_LAYOUT_META?.method || "optimized mixed strategy",
+          maximinValue: OPTIMIZED_LAYOUT_META?.maximin_value ?? null,
+          occupancy: OPTIMIZED_LAYOUT_META?.occupancy ?? null,
+        }
+      : { loaded: false, count: 0 };
+  }
+
+  matchingPool(sizes) {
+    if (!OPTIMIZED_LAYOUTS || !OPTIMIZED_LAYOUTS.length) return [];
+    const wanted = [...sizes].sort((a, b) => a - b).join(",");
+    return OPTIMIZED_LAYOUTS.filter(
+      (entry) => entry.layout.map((s) => s.length).sort((a, b) => a - b).join(",") === wanted
+    );
   }
 
   placeShips(fleetSizes) {
     const sizes = fleetSizes ? [...fleetSizes] : [...STANDARD_FLEET_SIZES];
-
-    // Mixed strategy: if the offline-optimized diverse pool is loaded, pick
-    // one of those layouts at random. Never reusing a single "best" layout
-    // keeps placement unpredictable to a repeat human opponent while every
-    // option is individually strong.
-    if (OPTIMIZED_LAYOUTS && OPTIMIZED_LAYOUTS.length) {
-      const wanted = [...sizes].sort((a, b) => a - b).join(",");
-      const matching = OPTIMIZED_LAYOUTS.filter(
-        (lay) => lay.map((s) => s.length).sort((a, b) => a - b).join(",") === wanted
-      );
-      if (matching.length) return choice(matching).map((s) => ({ ...s }));
+    if (this.strategy === "random") {
+      const layout = this.randomLegalLayout(sizes);
+      this.lastSelection = { strategy: "random", id: null };
+      return layout;
     }
 
+    const pool = this.matchingPool(sizes);
+    if (pool.length && (this.strategy === "adversarial" || this.strategy === "uniform")) {
+      const entry = this.strategy === "uniform" ? choice(pool) : this.chooseAdversarial(pool);
+      this.lastSelection = {
+        strategy: this.strategy,
+        id: entry.id,
+        baseWeight: entry.weight,
+        robustScore: entry.robustScore,
+        adaptiveScore: this.strategy === "adversarial" ? this._lastAdaptiveScore ?? null : null,
+      };
+      return entry.layout.map((s) => ({ ...s }));
+    }
+
+    // "live" and all pool-loading failures use the original game-based search.
+    const layout = this.liveSearch(sizes);
+    this.lastSelection = { strategy: "live", id: null };
+    return layout;
+  }
+
+  chooseAdversarial(pool) {
+    const rawScores = pool.map((entry) => this.historySurvivalScore(entry.layout));
+    const mean = rawScores.reduce((a, b) => a + b, 0) / rawScores.length;
+    const variance = rawScores.reduce((a, b) => a + (b - mean) ** 2, 0) / rawScores.length;
+    const sd = Math.sqrt(variance) || 1;
+    const recent = [...this.recentLayoutIds].reverse();
+
+    const weights = pool.map((entry, i) => {
+      const z = (rawScores[i] - mean) / sd;
+      let recencyFactor = 1;
+      const age = recent.indexOf(entry.id);
+      if (age >= 0 && age < 3) recencyFactor = 0.06;
+      else if (age >= 0 && age < 7) recencyFactor = 0.28;
+      else if (age >= 0) recencyFactor = 0.65;
+
+      // Keep a 22% untouchable maximin component so sparse or noisy user
+      // history cannot collapse the strategy into a predictable response.
+      const adaptive = Math.exp(this.adaptationStrength * Math.max(-2.5, Math.min(2.5, z)));
+      return entry.weight * recencyFactor * (0.22 + 0.78 * adaptive);
+    });
+    const selected = weightedEntryChoice(pool, weights);
+    const selectedIndex = pool.indexOf(selected);
+    this._lastAdaptiveScore = selectedIndex >= 0 ? rawScores[selectedIndex] : null;
+    return selected;
+  }
+
+  historySurvivalScore(layout) {
+    if (!this.shotHistory.length) return 0;
+    const occupied = new Set();
+    for (const ship of layout) {
+      for (const [r, c] of shipCells(ship.r, ship.c, ship.length, ship.orientation)) occupied.add(r * COLS + c);
+    }
+
+    let total = 0;
+    let totalWeight = 0;
+    const histories = this.shotHistory.slice(-24);
+    for (let g = 0; g < histories.length; g++) {
+      const record = histories[g];
+      const shots = Array.isArray(record) ? record : record?.shots;
+      if (!Array.isArray(shots) || !shots.length) continue;
+      const rank = new Map();
+      shots.forEach((idx, i) => rank.set(Number(idx), i + 1));
+      const unseenRank = Math.min(ROWS * COLS, shots.length + 16);
+      let lastRequired = 0;
+      let earlyExposure = 0;
+      for (const idx of occupied) {
+        const r = rank.get(idx) ?? unseenRank;
+        lastRequired = Math.max(lastRequired, r);
+        if (rank.has(idx)) earlyExposure += Math.exp(-(r - 1) / 15);
+      }
+      const survival = lastRequired / ROWS * COLS;
+      const danger = earlyExposure / 17;
+      const recency = 0.35 + 0.65 * ((g + 1) / histories.length);
+      total += recency * (1.15 * survival - 0.55 * danger);
+      totalWeight += recency;
+    }
+    return totalWeight ? total / totalWeight : 0;
+  }
+
+  liveSearch(sizes) {
     let bestLayout = null;
     let bestAvg = -Infinity;
     for (let i = 0; i < this.restarts; i++) {
@@ -1331,12 +1483,6 @@ class PlacementAI {
   }
 
   simulateGame(ships, sizes) {
-    // Uses the fast heuristic AI (not BayesianAI) as the internal evaluator
-    // -- BayesianAI is ~100x slower per game, which would make this search
-    // (dozens of simulated games) take minutes instead of ~1 second. A
-    // layout that resists ProbabilityAI well also resists BayesianAI well
-    // in practice, since both ultimately concentrate fire the same way
-    // once a hit is found.
     const board = makeEmptyBoard();
     const attacker = new ProbabilityAI(sizes);
     let shots = 0;

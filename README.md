@@ -1,97 +1,119 @@
-# Battleship AI Lab — POMCP Edition
+# Battleship AI Lab — POMCP + Adversarial Placement
 
-A static, client-side Battleship site for an 8×11 board. It includes four
-attacking algorithms, a live decision heatmap, evolved fleet placement, and a
-shared-layout benchmark that can run 100–200 games per fast algorithm.
+Static HTML/CSS/JavaScript Battleship on an **8 × 11** board with fleet sizes
+`[5, 4, 3, 3, 2]`.
 
-## Opponents
+The project contains four attack algorithms and four selectable placement
+policies. The default combination is the POMCP attacker plus the adversarial
+maximin placement policy.
 
-### POMCPAI — default / strongest implemented opponent
+## Is POMCP mathematically optimal?
 
-The new opponent is a Battleship-specialized implementation inspired by
-**POMCP (Partially Observable Monte-Carlo Planning)** from David Silver and
-Joel Veness, *Monte-Carlo Planning in Large POMDPs* (NeurIPS 2010).
+No. An exact optimal policy would solve the complete Battleship POMDP over all
+reachable beliefs and future action/observation histories. That is not practical
+at this board size. POMCP is a strong online approximation: it samples complete
+hidden fleets and uses Monte Carlo tree search to plan several observations
+forward. Other research POMDP solvers, such as DESPOT and offline graph-search
+methods, can be preferable under different compute budgets and assumptions.
 
-Battleship is treated as a partially observable planning problem:
+The included `POMCPAI` is therefore best understood as the strongest **tested
+browser-compatible attacker in this project**, not as a proof of globally
+optimal play.
 
-- A hidden state is one complete legal fleet layout.
-- An action is firing at an untested cell.
-- An observation is a miss, hit, or an exact sunk-ship announcement.
-- A particle belief stores possible complete fleets consistent with all
-  observations so far.
-- Each decision samples possible hidden fleets and runs PUCT/Monte-Carlo tree
-  search over future shot/observation branches.
+## Attack algorithms
 
-This differs from a greedy probability heatmap. A shot can be selected not
-only because it is likely to hit now, but because its result can improve later
-decisions. The playable opponent uses a larger search budget than the browser
-benchmark.
+- **POMCPAI** — particle belief plus online PUCT/Monte Carlo tree search.
+- **BayesianAI** — persistent complete-fleet particle posterior with greedy
+  occupancy/active-ship/sink scoring.
+- **ProbabilityAI** — fast independent-placement density heuristic.
+- **RandomAI** — uniform random legal shots.
 
-### BayesianAI
+The attacker benchmark runs all four on the same random layout sequence. The
+browser uses reduced POMCP/Bayesian settings for the 100–200 game benchmark;
+the playable opponents use stronger settings.
 
-Maintains a persistent particle population of complete fleet layouts and
-selects the cell with the strongest posterior occupancy/target/sink score. It
-is strong, but it is primarily greedy rather than performing an online search
-over future observations.
+## Adversarial placement policy
 
-The class now accepts optional particle settings so the benchmark can use a
-smaller, faster configuration without changing the full playable opponent.
+There is no strongest single fixed layout for repeated play: a fixed board can
+be learned and targeted. The default placement policy is therefore a weighted
+mixed strategy stored in `layouts.json`.
 
-### ProbabilityAI
+`optimize_placement.js` builds it in three stages:
 
-Enumerates legal placements for each ship length independently and builds a
-probability-density map. It is fast and much stronger than random, but it does
-not enforce whole-fleet consistency.
+1. **Evolutionary candidate search** — random legal layouts are mutated by
+   relocating, shifting, rotating, mirroring, moving toward edges, or moving
+   ships near one another.
+2. **Adversarial evaluation** — finalists are tested against seeded instances
+   of ProbabilityAI, BayesianAI, POMCPAI, and several deterministic human-style
+   hunt/target policies.
+3. **Maximin linear program** — SciPy chooses sampling weights that maximize the
+   minimum expected survival against the attack ensemble. Extra constraints
+   prevent one layout from receiving excessive weight and keep aggregate cell
+   occupancy reasonably flat.
 
-### RandomAI
+The generated quick-search pool contains **42 weighted layouts**. Its mean cell
+occupancy is exactly `17 / 88 ≈ 0.1932`; observed marginal occupancy across the
+pool ranges from approximately **0.130 to 0.245**.
 
-Uniform random legal shots. Included as a baseline.
+### Out-of-sample 100-game validation
 
-## Exact sunk feedback
+These games used seeds that were not used by the optimizer. Higher shots means
+stronger defense.
 
-`app.js` reports the exact length and cells of a newly sunk ship to algorithms
-that expose `recordShotResult()`. This is legal information in standard
-Battleship and prevents ambiguity when ships touch.
+| Attacker | Random placement | Previous 50-layout pool | New maximin mix |
+|---|---:|---:|---:|
+| ProbabilityAI | 50.99 | 59.90 | **62.27** |
+| BayesianAI benchmark mode | 45.23 | 47.30 | **51.18** |
+| POMCPAI benchmark mode | 43.48 | 43.51 | **48.92** |
 
-## Benchmark
+Against POMCP, the new policy survived about **5.4 extra shots** compared with
+the previous pool and random placement in this validation.
 
-The benchmark:
+## Runtime adaptation
 
-- Uses the same randomly generated fleet sequence for every algorithm.
-- Runs 100–200 games for RandomAI, ProbabilityAI, a fast BayesianAI
-  configuration, and a fast POMCPAI configuration.
-- Reports average shots, standard deviation, game count, and runtime.
-- Uses reduced particle/search budgets for BayesianAI and POMCPAI so the test
-  remains practical in a browser.
+The browser stores up to 30 of the player's firing sequences in local storage.
+The adversarial policy softly tilts its maximin weights toward layouts predicted
+to survive those habits, while:
 
-A 100-game validation run in the development environment produced:
+- preserving a fixed non-adaptive component,
+- penalizing recently used layout IDs,
+- continuing to sample randomly from many layouts.
 
-| Algorithm | Average shots | Standard deviation |
-|---|---:|---:|
-| POMCPAI benchmark mode | 41.65 | 7.33 |
-| BayesianAI benchmark mode | 45.46 | 7.99 |
-| ProbabilityAI | 51.80 | 8.57 |
-| RandomAI | 84.05 | 4.11 |
+The **Reset placement learning** button deletes this local profile. No data is
+sent to a server.
 
-Results vary because layouts and Monte-Carlo searches are randomized. Fewer
-shots is better.
+## Placement modes
 
-## Ship placement
+- **Adversarial maximin** — weighted optimized pool plus optional local
+  adaptation; default and strongest.
+- **Uniform elite pool** — ignores optimized weights and player history.
+- **Legacy live search** — generates random candidates and scores them against
+  ProbabilityAI at game start.
+- **Random placement** — baseline.
 
-The enemy fleet and **Auto-Place (Smart)** draw from `layouts.json`, a pool of
-strong, diverse layouts generated offline. The game chooses randomly from the
-pool so a repeated opponent cannot memorize one fixed arrangement. If the JSON
-file cannot be loaded, `PlacementAI` falls back to a live randomized search.
+The page includes a separate **Placement-defense benchmark** that runs 100–200
+games against POMCP, Bayesian, or ProbabilityAI.
 
-## Files
+## Re-running the optimizer
 
-- `index.html` — UI, opponent tabs, benchmark controls, algorithm descriptions
-- `style.css` — board, tab, and benchmark-table styling
-- `ai.js` — RandomAI, ProbabilityAI, BayesianAI, POMCPAI, and PlacementAI
-- `app.js` — game flow, exact shot feedback, opponent selection, benchmark
-- `layouts.json` — optional pre-optimized fleet-layout pool
+The optimizer requires Node.js and Python with NumPy/SciPy.
+
+```bash
+node optimize_placement.js --mode=quick --output=layouts.json
+```
+
+For a larger search:
+
+```bash
+node optimize_placement.js --mode=full --output=layouts.json
+```
+
+Full mode uses more candidates, attack seeds, and stricter mixture constraints,
+so it can take substantially longer.
 
 ## Run locally
+
+Use an HTTP server so `layouts.json` can be fetched:
 
 ```bash
 python -m http.server 8765
@@ -99,7 +121,16 @@ python -m http.server 8765
 
 Open `http://localhost:8765`.
 
-## Deploy to GitHub Pages
+Opening `index.html` directly through `file://` may block JSON loading. The game
+will still work, but placement falls back to legacy live search.
 
-Commit the files to a repository, then choose the repository branch/folder in
-**Settings → Pages**. No backend or build step is required.
+## Files
+
+- `index.html` — setup, opponent tabs, and both benchmarks.
+- `style.css` — responsive presentation.
+- `ai.js` — all attack AIs and placement policies.
+- `app.js` — game state, exact sunk notifications, local placement learning,
+  and benchmarks.
+- `layouts.json` — new weighted maximin pool.
+- `layouts_legacy.json` — previous 50-layout pool for comparison/reference.
+- `optimize_placement.js` — offline adversarial optimizer.

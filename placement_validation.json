@@ -1,0 +1,29 @@
+{
+  "board": {"rows": 8, "cols": 11},
+  "fleet": [5, 4, 3, 3, 2],
+  "games_per_cell": 100,
+  "evaluation": "out-of-sample seeded games not used by the optimizer",
+  "metric": "shots required to sink all ships; higher is better for placement",
+  "results": {
+    "ProbabilityAI": {
+      "random": 50.99,
+      "previous_pool": 59.90,
+      "adversarial_maximin": 62.27
+    },
+    "BayesianAI_benchmark": {
+      "random": 45.23,
+      "previous_pool": 47.30,
+      "adversarial_maximin": 51.18
+    },
+    "POMCPAI_benchmark": {
+      "random": 43.48,
+      "previous_pool": 43.51,
+      "adversarial_maximin": 48.92
+    }
+  },
+  "browser_smoke_POMCP_100_games": {
+    "random": 43.50,
+    "uniform_elite": 46.15,
+    "adversarial_maximin": 47.32
+  }
+}

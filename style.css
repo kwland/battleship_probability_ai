@@ -643,3 +643,21 @@ footer {
     background: rgba(77, 163, 255, 0.1);
   }
 }
+
+/* ---------------- Adversarial placement controls ---------------- */
+.placement-select-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.placement-select-label select {
+  width: 100%;
+}
+
+#placement-memory-status {
+  min-height: 1.2em;
+  text-align: center;
+}

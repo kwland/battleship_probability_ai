@@ -39,10 +39,21 @@
         <ul id="fleet-list" class="fleet-list"></ul>
         <div class="setup-actions">
           <button id="rotate-ship" type="button">⟳ Rotate</button>
-          <button id="smart-place" type="button">Auto-Place (Smart)</button>
+          <button id="smart-place" type="button">Auto-Place (Maximin)</button>
           <button id="clear-placement" type="button">Clear All</button>
         </div>
+        <label class="placement-select-label">
+          Enemy placement policy
+          <select id="placement-strategy">
+            <option value="adversarial" selected>Adversarial maximin (strongest)</option>
+            <option value="uniform">Uniform elite pool</option>
+            <option value="live">Legacy live search</option>
+            <option value="random">Random placement</option>
+          </select>
+        </label>
         <button id="start-battle" type="button" class="primary" disabled>Start Battle</button>
+        <button id="reset-placement-memory" type="button" class="secondary">Reset placement learning</button>
+        <span id="placement-memory-status" class="hint" aria-live="polite"></span>
       </div>
     </div>
   </section>
@@ -119,10 +130,36 @@
     <div id="bench-output" class="bench-output"></div>
   </section>
 
+  <section class="benchmark">
+    <h2>Placement-defense benchmark</h2>
+    <p>
+      Compares random placement, uniform sampling from the elite pool, and the
+      weighted adversarial maximin policy. Every result is the number of shots
+      the selected attacker needed to sink the fleet, so <strong>higher is better</strong>.
+    </p>
+    <div class="bench-controls">
+      <label>
+        Games per placement policy:
+        <input type="number" id="placement-bench-n" value="100" min="100" max="200" />
+      </label>
+      <label>
+        Attacker:
+        <select id="placement-bench-attacker">
+          <option value="pomcp" selected>POMCP benchmark mode</option>
+          <option value="bayesian">Bayesian benchmark mode</option>
+          <option value="probability">Probability AI</option>
+        </select>
+      </label>
+      <button id="placement-bench-run">Run placement benchmark</button>
+    </div>
+    <div id="placement-bench-output" class="bench-output"></div>
+  </section>
+
   <section class="about">
     <h2>How it works</h2>
     <p>
-      <strong>POMCP AI (default, research planner).</strong> Treats Battleship
+      <strong>POMCP AI (default, research planner).</strong> This is a strong
+      practical approximation, not a proof of optimal play. It treats Battleship
       as a partially observable planning problem. It maintains a particle
       belief over complete legal fleets, samples a possible hidden fleet for
       each simulation, then uses an online PUCT/Monte-Carlo tree search over
@@ -163,20 +200,18 @@
       actually impossible once the rest of the board is taken into account.
     </p>
     <p>
-      <strong>Ship placement.</strong> The enemy fleet (and the "Auto-Place
-      (Smart)" button) draws from a pool of layouts optimized offline by an
-      evolutionary search: it evolves candidate layouts over many
-      generations &mdash; mutating by moving, rotating, shifting, swapping,
-      or clustering ships &mdash; scoring each by how many shots a panel of
-      attackers needs to sink it, and rewards both average and
-      worst-case survival. From the result it keeps ~50 strong but
-      structurally <em>different</em> layouts and picks one at random each
-      game &mdash; a mixed strategy, so a repeat opponent can't learn a
-      single fixed pattern. (If that pre-computed pool isn't available, it
-      falls back to a quick live search that keeps the best of a handful of
-      random layouts.) The screening uses the fast Probability AI, not the
-      Bayesian AI, purely for speed &mdash; a layout that resists one
-      resists the other in practice.
+      <strong>Ship placement.</strong> A single fixed board is never the best
+      repeat-game defense because it can be memorized. The default placement
+      policy therefore samples from a weighted mixed strategy generated
+      offline. The optimizer evolves thousands of legal layouts, evaluates
+      finalists against seeded POMCP, Bayesian, Probability, and human-style
+      hunt/target policies, and solves a finite zero-sum maximin linear program.
+      It also constrains the pool's aggregate cell occupancy so no small group
+      of coordinates becomes an obvious opening target. Between games, the
+      browser may softly tilt those maximin weights away from cells the player
+      tends to fire at early, while retaining random exploration and avoiding
+      recently used layouts. The placement benchmark compares this strategy
+      directly with random and uniformly sampled elite fleets.
     </p>
   </section>
 </main>

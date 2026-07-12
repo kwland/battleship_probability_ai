@@ -5,6 +5,37 @@
 // button. Higher than the class default since this only runs once per game
 // and the board is small, so we can afford a more thorough search.
 const STRONG_PLACEMENT = { restarts: 25, gamesPerCandidate: 5 };
+const PLACEMENT_PROFILE_KEY = "battleship-placement-profile-v2";
+
+function loadPlacementProfile() {
+  try {
+    const value = JSON.parse(localStorage.getItem(PLACEMENT_PROFILE_KEY) || "null");
+    return {
+      games: Array.isArray(value?.games) ? value.games.slice(-30) : [],
+      recentLayoutIds: Array.isArray(value?.recentLayoutIds) ? value.recentLayoutIds.slice(-12) : [],
+    };
+  } catch (e) {
+    return { games: [], recentLayoutIds: [] };
+  }
+}
+
+function savePlacementProfile(profile) {
+  try {
+    localStorage.setItem(PLACEMENT_PROFILE_KEY, JSON.stringify({
+      games: (profile.games || []).slice(-30),
+      recentLayoutIds: (profile.recentLayoutIds || []).slice(-12),
+    }));
+  } catch (e) {
+    // Private browsing or disabled storage: the game still works without adaptation.
+  }
+}
+
+function resetPlacementProfile() {
+  try { localStorage.removeItem(PLACEMENT_PROFILE_KEY); } catch (e) {}
+  const status = document.getElementById("placement-memory-status");
+  if (status) status.textContent = "Placement learning reset.";
+}
+
 
 const ICON_HIT = `<svg class="icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
   <circle cx="12" cy="12" r="9" style="fill:var(--hit-glow);opacity:0.35"/>
@@ -37,9 +68,13 @@ const state = {
   shotsPlayer: 0,
   shotsAI: 0,
   heatmapOn: true,
+  playerShotSequence: [],
+  enemyPlacementMeta: null,
+  gameRecorded: false,
 };
 
 let setupCellEls = []; // [r][c] -> DOM element, built once per setup session
+let placementPoolPromise = null;
 
 /* ==================== Setup / placement phase ==================== */
 
@@ -218,9 +253,10 @@ function rotateSelected() {
   renderSetupShipLayer();
 }
 
-function smartAutoPlace() {
+async function smartAutoPlace() {
+  if (placementPoolPromise) await placementPoolPromise;
   const sizes = STANDARD_FLEET_SIZES;
-  const layout = new PlacementAI(STRONG_PLACEMENT).placeShips(sizes);
+  const layout = new PlacementAI({ ...STRONG_PLACEMENT, strategy: "adversarial" }).placeShips(sizes);
   // STANDARD_FLEET is already sorted largest-to-smallest, matching the
   // descending sort PlacementAI uses internally, so indices line up 1:1.
   state.setup.placed = layout.map((s) => ({ ...s, cells: shipCells(s.r, s.c, s.length, s.orientation) }));
@@ -254,13 +290,23 @@ function shipsAfloat(layout, boardState) {
   return layout.filter((ship) => !isShipSunk(ship, boardState)).length;
 }
 
-function startBattle() {
+async function startBattle() {
+  if (placementPoolPromise) await placementPoolPromise;
   const sizes = STANDARD_FLEET_SIZES;
 
   state.playerLayout = state.setup.placed.map((s) => ({ ...s }));
   state.playerShips = shipSetOf(state.playerLayout);
 
-  const enemyRaw = new PlacementAI(STRONG_PLACEMENT).placeShips(sizes);
+  const profile = loadPlacementProfile();
+  const placementStrategy = document.getElementById("placement-strategy")?.value || "adversarial";
+  const enemyPlacer = new PlacementAI({
+    ...STRONG_PLACEMENT,
+    strategy: placementStrategy,
+    shotHistory: profile.games,
+    recentLayoutIds: profile.recentLayoutIds,
+  });
+  const enemyRaw = enemyPlacer.placeShips(sizes);
+  state.enemyPlacementMeta = enemyPlacer.lastSelection;
   state.enemyLayout = withCells(enemyRaw);
   state.enemyShips = shipSetOf(state.enemyLayout);
 
@@ -282,6 +328,8 @@ function startBattle() {
   state.winner = null;
   state.shotsPlayer = 0;
   state.shotsAI = 0;
+  state.playerShotSequence = [];
+  state.gameRecorded = false;
 
   document.getElementById("setup-section").hidden = true;
   document.getElementById("battle-section").hidden = false;
@@ -292,6 +340,9 @@ function startBattle() {
 }
 
 function resetToSetup() {
+  if (state.phase === "battle" && !state.gameRecorded && state.playerShotSequence.length) {
+    recordPlacementGame("abandoned");
+  }
   state.phase = "setup";
   document.getElementById("battle-section").hidden = true;
   document.getElementById("setup-section").hidden = false;
@@ -302,17 +353,35 @@ function setStatus(msg) {
   document.getElementById("status").textContent = msg;
 }
 
+
+function recordPlacementGame(winner) {
+  if (state.gameRecorded) return;
+  state.gameRecorded = true;
+  const profile = loadPlacementProfile();
+  profile.games.push({
+    shots: [...state.playerShotSequence],
+    completed: winner === "player",
+    winner,
+    strategy: state.enemyPlacementMeta?.strategy || null,
+    timestamp: Date.now(),
+  });
+  if (state.enemyPlacementMeta?.id) profile.recentLayoutIds.push(state.enemyPlacementMeta.id);
+  savePlacementProfile(profile);
+}
+
 function onEnemyCellClick(r, c) {
   if (state.turn !== "player" || state.winner) return;
   if (state.enemyBoardState[r][c] !== null) return;
 
   state.shotsPlayer++;
+  state.playerShotSequence.push(r * COLS + c);
   const hit = state.enemyShips.has(key(r, c));
   state.enemyBoardState[r][c] = hit ? "hit" : "miss";
 
   if (shipsAfloat(state.enemyLayout, state.enemyBoardState) === 0) {
     state.winner = "player";
     state.turn = "over";
+    recordPlacementGame("player");
     setStatus(`You sank the enemy fleet in ${state.shotsPlayer} shots!`);
     render();
     return;
@@ -349,6 +418,7 @@ function aiTurn() {
   if (shipsAfloat(state.playerLayout, state.playerBoardState) === 0) {
     state.winner = "ai";
     state.turn = "over";
+    recordPlacementGame("ai");
     setStatus(`The AI sank your fleet in ${state.shotsAI} shots. Try again!`);
     render();
     return;
@@ -590,6 +660,77 @@ async function runBenchmark() {
   }
 }
 
+
+async function runPlacementBenchmark() {
+  if (placementPoolPromise) await placementPoolPromise;
+  const n = Math.max(100, Math.min(200, parseInt(document.getElementById("placement-bench-n").value, 10) || 100));
+  const attackerName = document.getElementById("placement-bench-attacker").value;
+  const output = document.getElementById("placement-bench-output");
+  const button = document.getElementById("placement-bench-run");
+  button.disabled = true;
+
+  const sizes = STANDARD_FLEET_SIZES;
+  const attackerFactory = attackerName === "probability"
+    ? (fleet) => new ProbabilityAI(fleet)
+    : attackerName === "bayesian"
+      ? (fleet) => new BayesianAI(fleet, { particles: 220, minParticles: 35, resampleBudgetMs: 8, poolPickAttempts: 12 })
+      : (fleet) => POMCPAI.benchmark(fleet);
+
+  const strategies = [
+    { key: "random", label: "Random placement", make: () => new PlacementAI({ strategy: "random" }).placeShips(sizes) },
+    { key: "uniform", label: "Uniform elite pool", make: () => new PlacementAI({ strategy: "uniform" }).placeShips(sizes) },
+    { key: "adversarial", label: "Adversarial maximin mix", make: () => new PlacementAI({ strategy: "adversarial" }).placeShips(sizes) },
+  ];
+
+  const results = [];
+  try {
+    for (const strategy of strategies) {
+      let total = 0;
+      let sumSq = 0;
+      const values = [];
+      const started = performance.now();
+      for (let i = 0; i < n; i++) {
+        const shots = playGame(attackerFactory, strategy.make(), sizes);
+        values.push(shots);
+        total += shots;
+        sumSq += shots * shots;
+        if (i % 5 === 4 || i + 1 === n) {
+          output.textContent = `Testing ${strategy.label}: ${i + 1}/${n} games...`;
+          await yieldToUI();
+        }
+      }
+      values.sort((a, b) => a - b);
+      const average = total / n;
+      results.push({
+        ...strategy,
+        average,
+        sd: Math.sqrt(Math.max(0, sumSq / n - average * average)),
+        p10: values[Math.floor(0.10 * (n - 1))],
+        median: values[Math.floor(0.50 * (n - 1))],
+        elapsed: performance.now() - started,
+      });
+    }
+    const ranked = [...results].sort((a, b) => b.average - a.average);
+    const info = PlacementAI.poolInfo();
+    output.innerHTML =
+      `<div class="benchmark-table-wrap"><table class="benchmark-table">` +
+      `<thead><tr><th>Rank</th><th>Placement policy</th><th>Avg. survival</th><th>SD</th><th>10th pct.</th><th>Median</th><th>Runtime</th></tr></thead><tbody>` +
+      ranked.map((r, i) =>
+        `<tr class="${r.key === "adversarial" ? "pomcp-row" : ""}"><td>${i + 1}</td><td>${r.label}</td>` +
+        `<td><strong>${r.average.toFixed(2)}</strong></td><td>${r.sd.toFixed(2)}</td><td>${r.p10}</td><td>${r.median}</td>` +
+        `<td>${(r.elapsed / 1000).toFixed(2)}s</td></tr>`
+      ).join("") +
+      `</tbody></table></div>` +
+      `<div class="bench-highlight">Higher is better. Pool: ${info.loaded ? `${info.count} weighted layouts` : "not loaded"}` +
+      `${info.maximinValue ? ` · training maximin value ${info.maximinValue.toFixed(2)}` : ""}.</div>`;
+  } catch (error) {
+    output.textContent = `Placement benchmark failed: ${error.message}`;
+    console.error(error);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 /* ==================== Wiring ==================== */
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -614,6 +755,8 @@ document.addEventListener("DOMContentLoaded", () => {
     if (state.phase === "battle") render();
   });
   document.getElementById("bench-run").addEventListener("click", runBenchmark);
+  document.getElementById("placement-bench-run").addEventListener("click", runPlacementBenchmark);
+  document.getElementById("reset-placement-memory").addEventListener("click", resetPlacementProfile);
 
   window.addEventListener("keydown", (e) => {
     if (state.phase !== "setup") return;
@@ -623,7 +766,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // Load the offline-optimized diverse placement pool in the background. If
   // it arrives before the first battle, the enemy fleet and "Auto-Place
   // (Smart)" draw from it; otherwise PlacementAI falls back to a live search.
-  loadOptimizedLayouts();
+  placementPoolPromise = loadOptimizedLayouts();
 
   initSetup();
 });
