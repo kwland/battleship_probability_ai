@@ -1,0 +1,79 @@
+{
+  "selected": {
+    "method": "held-out grid self-play",
+    "generated_at": "2026-07-12T01:55:13.664Z",
+    "training_games": 60,
+    "validation_games": 100,
+    "selected_parameters": {
+      "information": 0,
+      "parity": 0.12,
+      "sink": 5.5
+    },
+    "baseline_validation_average": 44.04,
+    "selected_validation_average": 42.81,
+    "selected_validation_sd": 8.431719872007125,
+    "elapsed_seconds": 25.7545754
+  },
+  "finalists": [
+    {
+      "params": {
+        "information": 0,
+        "parity": 0.12,
+        "sink": 5.5
+      },
+      "baseline": false,
+      "validation": {
+        "average": 42.81,
+        "sd": 8.431719872007125
+      }
+    },
+    {
+      "params": {
+        "information": 0.06,
+        "parity": 0.05,
+        "sink": 3.5
+      },
+      "baseline": false,
+      "validation": {
+        "average": 42.92,
+        "sd": 7.231431393576238
+      }
+    },
+    {
+      "params": {
+        "information": 0,
+        "parity": 0.2,
+        "sink": 3
+      },
+      "baseline": false,
+      "validation": {
+        "average": 43.37,
+        "sd": 7.107256854792878
+      }
+    },
+    {
+      "params": {
+        "information": 0,
+        "parity": 0.05,
+        "sink": 3
+      },
+      "baseline": false,
+      "validation": {
+        "average": 43.67,
+        "sd": 7.340374649839055
+      }
+    },
+    {
+      "params": {
+        "information": 0.12,
+        "parity": 0,
+        "sink": 4
+      },
+      "baseline": true,
+      "validation": {
+        "average": 44.04,
+        "sd": 7.8815226955202045
+      }
+    }
+  ]
+}

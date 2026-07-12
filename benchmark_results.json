@@ -1,0 +1,30 @@
+{
+  "games": 100,
+  "board": "random legal layouts",
+  "results": {
+    "Probability": {
+      "average": 51.66,
+      "sd": 8.123078234265645,
+      "runtime_seconds": 0.687979468,
+      "max_move_ms": 2.2778169999999704
+    },
+    "POMCP": {
+      "average": 41.97,
+      "sd": 7.804428230178064,
+      "runtime_seconds": 4.933914301,
+      "max_move_ms": 19.41454900000008
+    },
+    "Hybrid": {
+      "average": 40.65,
+      "sd": 7.647712076170244,
+      "runtime_seconds": 5.447676616000001,
+      "max_move_ms": 30.781124000001
+    },
+    "HybridPolicy": {
+      "average": 42.45,
+      "sd": 6.824038393795836,
+      "runtime_seconds": 4.3031384379999995,
+      "max_move_ms": 18.8169659999985
+    }
+  }
+}

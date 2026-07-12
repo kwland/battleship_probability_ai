@@ -75,6 +75,7 @@ const state = {
 
 let setupCellEls = []; // [r][c] -> DOM element, built once per setup session
 let placementPoolPromise = null;
+let hybridModelPromise = null;
 
 /* ==================== Setup / placement phase ==================== */
 
@@ -292,6 +293,7 @@ function shipsAfloat(layout, boardState) {
 
 async function startBattle() {
   if (placementPoolPromise) await placementPoolPromise;
+  if (hybridModelPromise) await hybridModelPromise;
   const sizes = STANDARD_FLEET_SIZES;
 
   state.playerLayout = state.setup.placed.map((s) => ({ ...s }));
@@ -320,8 +322,10 @@ async function startBattle() {
     state.attackerAI = new ProbabilityAI(sizes);
   } else if (difficulty === "bayesian") {
     state.attackerAI = new BayesianAI(sizes);
-  } else {
+  } else if (difficulty === "pomcp") {
     state.attackerAI = new POMCPAI(sizes);
+  } else {
+    state.attackerAI = new HybridAI(sizes);
   }
 
   state.turn = "player";
@@ -596,6 +600,7 @@ function yieldToUI() {
 }
 
 async function runBenchmark() {
+  if (hybridModelPromise) await hybridModelPromise;
   const n = Math.max(100, Math.min(200, parseInt(document.getElementById("bench-n").value, 10) || 100));
   const output = document.getElementById("bench-output");
   const button = document.getElementById("bench-run");
@@ -612,6 +617,7 @@ async function runBenchmark() {
     { key: "probability", label: "ProbabilityAI", games: n, factory: (fleet) => new ProbabilityAI(fleet) },
     { key: "bayesian", label: "BayesianAI", games: nBayes, factory: (fleet) => new BayesianAI(fleet, { particles: 220, minParticles: 35, resampleBudgetMs: 8, poolPickAttempts: 12 }) },
     { key: "pomcp", label: "POMCPAI", games: n, factory: (fleet) => POMCPAI.benchmark(fleet) },
+    { key: "hybrid", label: "HybridAI", games: n, factory: (fleet) => HybridAI.benchmark(fleet) },
   ];
 
   const results = [];
@@ -645,13 +651,13 @@ async function runBenchmark() {
       `<div class="benchmark-table-wrap"><table class="benchmark-table">` +
       `<thead><tr><th>Rank</th><th>Algorithm</th><th>Avg. shots</th><th>SD</th><th>Games</th><th>Runtime</th></tr></thead><tbody>` +
       ranked.map((r, i) =>
-        `<tr class="${r.key === "pomcp" ? "pomcp-row" : ""}"><td>${i + 1}</td><td>${r.label}</td>` +
+        `<tr class="${r.key === "hybrid" ? "pomcp-row" : ""}"><td>${i + 1}</td><td>${r.label}</td>` +
         `<td><strong>${r.average.toFixed(2)}</strong></td><td>${r.sd.toFixed(2)}</td><td>${r.games}</td>` +
         `<td>${(r.elapsed / 1000).toFixed(2)}s</td></tr>`
       ).join("") +
       `</tbody></table></div>` +
       `<div class="bench-highlight">Best result: <strong>${winner.label}</strong> at ${winner.average.toFixed(2)} average shots. ` +
-      `Bayesian and POMCP both use reduced particle/search budgets in this 100–200 game speed benchmark; the playable opponents use stronger budgets.</div>`;
+      `Bayesian, POMCP, and Hybrid use reduced particle/search budgets in this 100–200 game benchmark; playable opponents use stronger budgets.</div>`;
   } catch (error) {
     output.textContent = `Benchmark failed: ${error.message}`;
     console.error(error);
@@ -663,6 +669,7 @@ async function runBenchmark() {
 
 async function runPlacementBenchmark() {
   if (placementPoolPromise) await placementPoolPromise;
+  if (hybridModelPromise) await hybridModelPromise;
   const n = Math.max(100, Math.min(200, parseInt(document.getElementById("placement-bench-n").value, 10) || 100));
   const attackerName = document.getElementById("placement-bench-attacker").value;
   const output = document.getElementById("placement-bench-output");
@@ -674,7 +681,9 @@ async function runPlacementBenchmark() {
     ? (fleet) => new ProbabilityAI(fleet)
     : attackerName === "bayesian"
       ? (fleet) => new BayesianAI(fleet, { particles: 220, minParticles: 35, resampleBudgetMs: 8, poolPickAttempts: 12 })
-      : (fleet) => POMCPAI.benchmark(fleet);
+      : attackerName === "pomcp"
+        ? (fleet) => POMCPAI.benchmark(fleet)
+        : (fleet) => HybridAI.benchmark(fleet);
 
   const strategies = [
     { key: "random", label: "Random placement", make: () => new PlacementAI({ strategy: "random" }).placeShips(sizes) },
@@ -767,6 +776,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // it arrives before the first battle, the enemy fleet and "Auto-Place
   // (Smart)" draw from it; otherwise PlacementAI falls back to a live search.
   placementPoolPromise = loadOptimizedLayouts();
+  hybridModelPromise = loadHybridModel();
 
   initSetup();
 });

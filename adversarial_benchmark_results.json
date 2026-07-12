@@ -1,0 +1,18 @@
+{
+  "games": 100,
+  "board": "adversarial optimized layout pool",
+  "results": {
+    "POMCP": {
+      "average": 47.59,
+      "sd": 7.234770210587196,
+      "runtime_seconds": 4.918432644,
+      "max_move_ms": 23.376006
+    },
+    "Hybrid": {
+      "average": 46.31,
+      "sd": 6.25251149539126,
+      "runtime_seconds": 5.394049818,
+      "max_move_ms": 23.611961
+    }
+  }
+}

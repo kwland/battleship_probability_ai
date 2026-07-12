@@ -3,15 +3,15 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Battleship AI Lab — POMCP</title>
+<title>Battleship AI Lab — Hybrid</title>
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
 <header>
   <h1>Battleship AI Lab</h1>
   <p class="subtitle">
-    Compare four Battleship opponents on an 8&times;11 board, including a
-    research-inspired POMCP online planner. Place your fleet, inspect each
+    Compare five Battleship opponents on an 8&times;11 board, including a
+    trained-policy hybrid planner and research-inspired POMCP. Place your fleet, inspect each
     AI's live heatmap, and run a fair shared-layout benchmark.
   </p>
 </header>
@@ -64,9 +64,10 @@
       <button id="new-game">New Game</button>
       <div class="opponent-picker">
         <span class="picker-label">Opponent:</span>
-        <input id="difficulty" type="hidden" value="pomcp" />
+        <input id="difficulty" type="hidden" value="hybrid" />
         <div class="ai-tabs" role="tablist" aria-label="Choose AI opponent">
-          <button type="button" class="ai-tab active" data-ai-value="pomcp" role="tab" aria-selected="true">POMCP</button>
+          <button type="button" class="ai-tab active" data-ai-value="hybrid" role="tab" aria-selected="true">Hybrid</button>
+          <button type="button" class="ai-tab" data-ai-value="pomcp" role="tab" aria-selected="false">POMCP</button>
           <button type="button" class="ai-tab" data-ai-value="bayesian" role="tab" aria-selected="false">Bayesian</button>
           <button type="button" class="ai-tab" data-ai-value="probability" role="tab" aria-selected="false">Probability</button>
           <button type="button" class="ai-tab" data-ai-value="random" role="tab" aria-selected="false">Random</button>
@@ -111,21 +112,21 @@
   </section>
 
   <section class="benchmark">
-    <h2>Four-algorithm benchmark</h2>
+    <h2>Five-algorithm benchmark</h2>
     <p>
-      Runs Random, Probability, Bayesian, and POMCP attackers against the same
-      sequence of random fleets. Bayesian and POMCP use reduced particle/search budgets here so a
+      Runs Random, Probability, Bayesian, POMCP, and Hybrid attackers against the same
+      sequence of random fleets. The planning AIs use reduced search budgets here so a
       100&ndash;200 game test remains practical in the browser. Fewer shots is better.
     </p>
     <div class="benchmark-tabs" aria-label="Algorithms included in benchmark">
-      <span>Random</span><span>Probability</span><span>Bayesian</span><span class="active">POMCP</span>
+      <span>Random</span><span>Probability</span><span>Bayesian</span><span>POMCP</span><span class="active">Hybrid</span>
     </div>
     <div class="bench-controls">
       <label>
-        Games per fast AI:
+        Games per algorithm:
         <input type="number" id="bench-n" value="100" min="100" max="200" />
       </label>
-      <button id="bench-run">Run 4-way benchmark</button>
+      <button id="bench-run">Run 5-way benchmark</button>
     </div>
     <div id="bench-output" class="bench-output"></div>
   </section>
@@ -145,7 +146,8 @@
       <label>
         Attacker:
         <select id="placement-bench-attacker">
-          <option value="pomcp" selected>POMCP benchmark mode</option>
+          <option value="hybrid" selected>Hybrid benchmark mode</option>
+          <option value="pomcp">POMCP benchmark mode</option>
           <option value="bayesian">Bayesian benchmark mode</option>
           <option value="probability">Probability AI</option>
         </select>
@@ -158,7 +160,18 @@
   <section class="about">
     <h2>How it works</h2>
     <p>
-      <strong>POMCP AI (default, research planner).</strong> This is a strong
+      <strong>Hybrid AI (default, trained planner).</strong> This keeps POMCP's
+      complete-fleet belief and legal move guarantees, but a compact policy
+      trained through offline self-play ranks shots from posterior occupancy,
+      sink chance, information gain, hit geometry, parity, and spatial priors.
+      POMCP then searches only the strongest candidates. When the late-game
+      hypothesis space becomes small, it attempts exact enumeration instead of
+      relying only on sampled particles. The model is stored in
+      <code>policy_model.json</code>, with identical fallback weights embedded
+      in <code>ai.js</code> for tournament runners that accept only one file.
+    </p>
+    <p>
+      <strong>POMCP AI (research planner).</strong> This is a strong
       practical approximation, not a proof of optimal play. It treats Battleship
       as a partially observable planning problem. It maintains a particle
       belief over complete legal fleets, samples a possible hidden fleet for
